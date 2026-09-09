@@ -8,6 +8,9 @@ from datetime import datetime, timedelta, timezone
 
 from websockets.asyncio.server import serve
 
+import psycopg
+from psycopg import errors as psycopg_errors
+
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "8765"))
 
@@ -15,13 +18,13 @@ MIN_CHAT_LEVEL = 5
 MAX_HISTORY = 50
 MAX_MESSAGE_LENGTH = 100
 
-# 계정 시스템 3차 - 정원번호 검색용 간단 계정 저장소
-# Render 무료 웹서비스의 로컬 파일은 재배포/재시작 정책에 따라 영구 보존이 보장되지 않습니다.
-# 현재 단계는 기능 테스트용이며, 정식 계정 복구/영구 저장은 외부 DB로 이전해야 합니다.
-ACCOUNT_DB_PATH = os.environ.get(
-    "FLOWERGARDEN_ACCOUNT_DB",
-    "flowergarden_accounts.json",
-)
+# ==================================================
+# 🌱 계정 시스템 영구저장 - 외부 PostgreSQL
+# ==================================================
+# Render Free Web Service의 로컬 파일은 영구 저장용으로 사용하지 않습니다.
+# DATABASE_URL 환경변수에 Neon/Supabase 등 외부 PostgreSQL 연결주소를 넣으면
+# 정원번호/닉네임/레벨이 서버 재시작·재배포 후에도 유지됩니다.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 ACCOUNT_LOOKUP_COOLDOWN_SECONDS = 1.0
 
 # 신고 정책
@@ -51,13 +54,6 @@ banned_until_by_user = {}
 # target_user_id -> {reporter_user_id: monotonic_report_time}
 report_votes = {}
 
-# 계정 시스템 3차
-# garden_number -> {user_id, nickname, garden_number, level, updated_at}
-accounts_by_number = {}
-# user_id -> garden_number
-account_number_by_user = {}
-
-
 def now_kst_iso() -> str:
     return datetime.now(KST).isoformat(timespec="seconds")
 
@@ -75,86 +71,91 @@ def is_valid_garden_number(value: str) -> bool:
     return len(value) == 6 and value.isdigit()
 
 
-def load_account_db():
-    accounts_by_number.clear()
-    account_number_by_user.clear()
+def get_account_db_connection():
+    if not DATABASE_URL:
+        return None
+    return psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=10,
+    )
+
+
+def ensure_account_db() -> bool:
+    if not DATABASE_URL:
+        print("[계정 DB] DATABASE_URL 환경변수가 아직 없습니다.")
+        return False
 
     try:
-        with open(ACCOUNT_DB_PATH, "r", encoding="utf-8") as fp:
-            raw = json.load(fp)
-    except FileNotFoundError:
-        return
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_accounts (
+                        user_id VARCHAR(80) PRIMARY KEY,
+                        garden_number CHAR(6) UNIQUE NOT NULL,
+                        nickname VARCHAR(12) NOT NULL,
+                        level INTEGER NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+            conn.commit()
+        return True
     except Exception as exc:
         print(
-            "[계정 DB 읽기 오류] "
+            "[계정 DB 준비 오류] "
             f"{type(exc).__name__}: {exc}"
         )
-        return
-
-    if isinstance(raw, dict) and isinstance(raw.get("accounts"), dict):
-        raw_accounts = raw.get("accounts", {})
-    elif isinstance(raw, dict):
-        raw_accounts = raw
-    else:
-        raw_accounts = {}
-
-    for garden_number, item in raw_accounts.items():
-        if not isinstance(item, dict):
-            continue
-
-        garden_number = str(garden_number).strip()
-        user_id = str(item.get("user_id", "")).strip()
-        nickname = str(item.get("nickname", "")).strip()
-
-        if not is_valid_garden_number(garden_number):
-            continue
-        if not user_id or len(user_id) > 80:
-            continue
-        if not (2 <= len(nickname) <= 12):
-            continue
-
-        try:
-            level = max(0, int(item.get("level", 0)))
-        except (TypeError, ValueError):
-            level = 0
-
-        record = {
-            "user_id": user_id,
-            "nickname": nickname,
-            "garden_number": garden_number,
-            "level": level,
-            "updated_at": str(item.get("updated_at", "")),
-        }
-
-        accounts_by_number[garden_number] = record
-        account_number_by_user[user_id] = garden_number
+        return False
 
 
-def save_account_db():
-    payload = {
-        "version": 1,
-        "accounts": accounts_by_number,
-    }
-
-    directory = os.path.dirname(os.path.abspath(ACCOUNT_DB_PATH))
-    temp_path = ACCOUNT_DB_PATH + ".tmp"
+def count_account_records() -> int:
+    if not DATABASE_URL:
+        return 0
 
     try:
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        with open(temp_path, "w", encoding="utf-8") as fp:
-            json.dump(payload, fp, ensure_ascii=False, indent=2)
-        os.replace(temp_path, ACCOUNT_DB_PATH)
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM gardener_accounts")
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def lookup_account_record(garden_number: str):
+    if not DATABASE_URL:
+        return None, "account_db_unavailable"
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT user_id, nickname, garden_number, level
+                    FROM gardener_accounts
+                    WHERE garden_number = %s
+                    """,
+                    (garden_number,),
+                )
+                row = cur.fetchone()
+
+        if not row:
+            return None, ""
+
+        return {
+            "user_id": str(row[0]),
+            "nickname": str(row[1]),
+            "garden_number": str(row[2]).strip(),
+            "level": int(row[3]),
+        }, ""
+
     except Exception as exc:
         print(
-            "[계정 DB 저장 오류] "
+            "[계정 DB 검색 오류] "
             f"{type(exc).__name__}: {exc}"
         )
-        try:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-        except OSError:
-            pass
+        return None, "account_db_error"
 
 
 def register_account_record(
@@ -183,20 +184,11 @@ def register_account_record(
     if not is_valid_garden_number(garden_number):
         return False, "invalid_garden_number", "정원번호 6자리를 확인해주세요."
 
-    old_number = account_number_by_user.get(user_id)
-    if old_number and old_number != garden_number:
+    if not DATABASE_URL:
         return (
             False,
-            "garden_number_locked",
-            "이 정원사의 정원번호는 이미 다른 번호로 등록되어 있어요.",
-        )
-
-    existing = accounts_by_number.get(garden_number)
-    if existing and existing.get("user_id") != user_id:
-        return (
-            False,
-            "garden_number_conflict",
-            "이 정원번호가 다른 정원사와 겹쳤어요. 운영자에게 알려주세요.",
+            "account_db_unavailable",
+            "계정 영구저장 서버가 아직 연결되지 않았어요.",
         )
 
     try:
@@ -204,22 +196,89 @@ def register_account_record(
     except (TypeError, ValueError):
         level = 0
 
-    new_record = {
-        "user_id": user_id,
-        "nickname": nickname,
-        "garden_number": garden_number,
-        "level": level,
-        "updated_at": now_kst_iso(),
-    }
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT garden_number
+                    FROM gardener_accounts
+                    WHERE user_id = %s
+                    """,
+                    (user_id,),
+                )
+                own_row = cur.fetchone()
 
-    changed = existing != new_record
-    accounts_by_number[garden_number] = new_record
-    account_number_by_user[user_id] = garden_number
+                if own_row and str(own_row[0]).strip() != garden_number:
+                    return (
+                        False,
+                        "garden_number_locked",
+                        "이 정원사의 정원번호는 이미 다른 번호로 등록되어 있어요.",
+                    )
 
-    if changed:
-        save_account_db()
+                cur.execute(
+                    """
+                    SELECT user_id
+                    FROM gardener_accounts
+                    WHERE garden_number = %s
+                    """,
+                    (garden_number,),
+                )
+                number_row = cur.fetchone()
 
-    return True, "ok", "정원사 정보가 등록되었어요."
+                if number_row and str(number_row[0]).strip() != user_id:
+                    return (
+                        False,
+                        "garden_number_conflict",
+                        "이 정원번호가 다른 정원사와 겹쳤어요. 운영자에게 알려주세요.",
+                    )
+
+                if own_row:
+                    cur.execute(
+                        """
+                        UPDATE gardener_accounts
+                        SET nickname = %s,
+                            level = %s,
+                            updated_at = NOW()
+                        WHERE user_id = %s
+                        """,
+                        (nickname, level, user_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO gardener_accounts (
+                            user_id,
+                            nickname,
+                            garden_number,
+                            level,
+                            updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, NOW())
+                        """,
+                        (user_id, nickname, garden_number, level),
+                    )
+
+            conn.commit()
+
+        return True, "ok", "정원사 정보가 영구 저장되었어요."
+
+    except psycopg_errors.UniqueViolation:
+        return (
+            False,
+            "garden_number_conflict",
+            "이 정원번호가 다른 정원사와 겹쳤어요. 운영자에게 알려주세요.",
+        )
+    except Exception as exc:
+        print(
+            "[계정 DB 저장 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return (
+            False,
+            "account_db_error",
+            "계정 저장 서버에 잠시 문제가 있어요.",
+        )
 
 
 def local_ipv4_candidates():
@@ -502,7 +561,22 @@ async def handle_account_lookup(ws, payload: dict):
         )
         return
 
-    record = accounts_by_number.get(garden_number)
+    record, lookup_error = lookup_account_record(garden_number)
+
+    if lookup_error:
+        await send_json(
+            ws,
+            {
+                "type": "error",
+                "code": lookup_error,
+                "message": (
+                    "정원사 계정 저장소에 연결하지 못했어요. "
+                    "잠시 후 다시 시도해주세요."
+                ),
+            },
+        )
+        return
+
     if not record:
         await send_json(
             ws,
@@ -1140,14 +1214,16 @@ async def handle_client(ws):
 
 
 async def main():
-    load_account_db()
+    account_db_ready = ensure_account_db()
 
     print("=" * 60)
-    print(" FlowerGarden 정원사 광장 + 계정찾기 Render 서버 v3")
+    print(" FlowerGarden 정원사 광장 + 영구계정 Render 서버 v4")
     print("=" * 60)
     print(f"Render 서버 포트: {PORT}")
-    print(f"등록된 정원사 계정: {len(accounts_by_number)}명")
-    print(f"계정 DB: {os.path.abspath(ACCOUNT_DB_PATH)}")
+    if account_db_ready:
+        print(f"영구 계정 DB 연결: 정상 / 등록 {count_account_records()}명")
+    else:
+        print("영구 계정 DB 연결: 미설정 또는 연결 실패")
 
     ips = local_ipv4_candidates()
 
