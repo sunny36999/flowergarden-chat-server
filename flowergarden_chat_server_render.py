@@ -1,3 +1,4 @@
+# FlowerGarden Render server v7 - 친구 꽃밭 보기/서리 + 기존 계정/친구/방명록/광장 유지
 import asyncio
 import json
 import os
@@ -142,6 +143,47 @@ def ensure_account_db() -> bool:
                     """
                     CREATE INDEX IF NOT EXISTS idx_guestbook_owner_created
                     ON gardener_guestbook_entries (owner_user_id, created_at DESC)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_garden_snapshots (
+                        owner_user_id VARCHAR(80) PRIMARY KEY
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        plots JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_garden_steals (
+                        requester_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        owner_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        area_id VARCHAR(12) NOT NULL,
+                        bloom_id VARCHAR(140) NOT NULL,
+                        flower_id VARCHAR(100) NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (
+                            requester_user_id,
+                            owner_user_id,
+                            area_id,
+                            bloom_id
+                        ),
+                        CHECK (requester_user_id <> owner_user_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_garden_steals_owner_bloom
+                    ON gardener_garden_steals (
+                        owner_user_id,
+                        area_id,
+                        bloom_id
+                    )
                     """
                 )
             conn.commit()
@@ -532,6 +574,304 @@ def respond_friend_request(user_id: str, requester_garden_number: str, accept: b
 # 읽기는 모든 등록 정원사, 작성은 친구만 가능합니다.
 # 작성자는 자기 글을 삭제할 수 있고, 방명록 주인은 자기 방명록의 모든 글을 삭제할 수 있습니다.
 # ==================================================
+
+GARDEN_AREA_IDS = ("center", "right", "left")
+
+
+def sanitize_garden_plots(raw_plots):
+    if not isinstance(raw_plots, list):
+        return None
+
+    by_area = {}
+    for raw in raw_plots[:6]:
+        if not isinstance(raw, dict):
+            continue
+
+        area_id = str(raw.get("area_id", "")).strip()
+        if area_id not in GARDEN_AREA_IDS:
+            continue
+
+        unlocked = bool(raw.get("unlocked", False))
+        flower_id = str(raw.get("flower_id", "")).strip()[:100]
+        bloom_id = str(raw.get("bloom_id", "")).strip()[:140]
+
+        try:
+            stage = max(0, min(4, int(raw.get("stage", 0))))
+        except (TypeError, ValueError):
+            stage = 0
+
+        fully_grown = bool(raw.get("fully_grown", False)) or stage >= 4
+
+        if not unlocked:
+            flower_id = ""
+            bloom_id = ""
+            stage = 0
+            fully_grown = False
+        elif not flower_id or stage <= 0:
+            flower_id = ""
+            bloom_id = ""
+            stage = 0
+            fully_grown = False
+        elif not fully_grown:
+            bloom_id = ""
+            stage = max(1, min(3, stage))
+        else:
+            stage = 4
+            fully_grown = True
+
+        by_area[area_id] = {
+            "area_id": area_id,
+            "unlocked": unlocked,
+            "flower_id": flower_id,
+            "stage": stage,
+            "fully_grown": fully_grown,
+            "bloom_id": bloom_id,
+        }
+
+    result = []
+    for area_id in GARDEN_AREA_IDS:
+        if area_id in by_area:
+            result.append(by_area[area_id])
+        else:
+            result.append({
+                "area_id": area_id,
+                "unlocked": area_id == "center",
+                "flower_id": "",
+                "stage": 0,
+                "fully_grown": False,
+                "bloom_id": "",
+            })
+    return result
+
+
+def save_garden_snapshot(user_id: str, raw_plots):
+    if not DATABASE_URL:
+        return False, "account_db_unavailable", "꽃밭 저장소가 아직 연결되지 않았어요."
+
+    plots = sanitize_garden_plots(raw_plots)
+    if plots is None:
+        return False, "invalid_garden_snapshot", "꽃밭 정보를 확인할 수 없어요."
+
+    try:
+        plots_json = json.dumps(plots, ensure_ascii=False)
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO gardener_garden_snapshots (
+                        owner_user_id,
+                        plots,
+                        updated_at
+                    )
+                    VALUES (%s, %s::jsonb, NOW())
+                    ON CONFLICT (owner_user_id)
+                    DO UPDATE SET
+                        plots = EXCLUDED.plots,
+                        updated_at = NOW()
+                    """,
+                    (user_id, plots_json),
+                )
+            conn.commit()
+        return True, "ok", "꽃밭 정보가 저장되었어요."
+    except Exception as exc:
+        print(f"[꽃밭 저장 오류] {type(exc).__name__}: {exc}")
+        return False, "garden_db_error", "꽃밭 정보를 저장하지 못했어요."
+
+
+def load_garden_snapshot(requester_user_id: str, owner_garden_number: str):
+    owner_record, lookup_error = lookup_account_record(owner_garden_number)
+    if lookup_error:
+        return None, lookup_error
+    if not owner_record:
+        return None, "owner_not_found"
+
+    owner_user_id = str(owner_record.get("user_id", ""))
+    is_owner = requester_user_id == owner_user_id
+    if not is_owner and get_friend_status(requester_user_id, owner_user_id) != "friends":
+        return None, "friends_only"
+
+    try:
+        plots = []
+        has_snapshot = False
+        stolen_keys = set()
+
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT plots
+                    FROM gardener_garden_snapshots
+                    WHERE owner_user_id = %s
+                    """,
+                    (owner_user_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    has_snapshot = True
+                    raw_plots = row[0]
+                    if isinstance(raw_plots, str):
+                        raw_plots = json.loads(raw_plots)
+                    sanitized = sanitize_garden_plots(raw_plots)
+                    if sanitized is not None:
+                        plots = sanitized
+
+                if not is_owner:
+                    cur.execute(
+                        """
+                        SELECT area_id, bloom_id
+                        FROM gardener_garden_steals
+                        WHERE requester_user_id = %s
+                          AND owner_user_id = %s
+                        """,
+                        (requester_user_id, owner_user_id),
+                    )
+                    stolen_keys = {
+                        (str(r[0]), str(r[1]))
+                        for r in cur.fetchall()
+                    }
+
+        if not plots:
+            plots = sanitize_garden_plots([])
+
+        result_plots = []
+        for plot in plots:
+            item = dict(plot)
+            key = (
+                str(item.get("area_id", "")),
+                str(item.get("bloom_id", "")),
+            )
+            bloom_ready = (
+                bool(item.get("unlocked", False))
+                and bool(item.get("fully_grown", False))
+                and int(item.get("stage", 0)) >= 4
+                and bool(item.get("flower_id", ""))
+                and bool(item.get("bloom_id", ""))
+            )
+            already_stolen = (not is_owner) and key in stolen_keys
+            item["already_stolen"] = already_stolen
+            item["can_steal"] = (
+                not is_owner
+                and bloom_ready
+                and not already_stolen
+            )
+            result_plots.append(item)
+
+        return {
+            "owner_nickname": owner_record.get("nickname", "정원사"),
+            "owner_garden_number": owner_garden_number,
+            "owner_level": int(owner_record.get("level", 0)),
+            "is_owner": is_owner,
+            "has_snapshot": has_snapshot,
+            "plots": result_plots,
+        }, ""
+
+    except Exception as exc:
+        print(f"[꽃밭 불러오기 오류] {type(exc).__name__}: {exc}")
+        return None, "garden_db_error"
+
+
+def steal_garden_flower(
+    requester_user_id: str,
+    owner_garden_number: str,
+    area_id: str,
+    bloom_id: str,
+):
+    area_id = str(area_id).strip()
+    bloom_id = str(bloom_id).strip()
+
+    if area_id not in GARDEN_AREA_IDS or not bloom_id:
+        return False, "invalid_steal_target", "서리할 꽃을 확인할 수 없어요.", ""
+
+    owner_record, lookup_error = lookup_account_record(owner_garden_number)
+    if lookup_error:
+        return False, lookup_error, "꽃밭 저장소에 연결하지 못했어요.", ""
+    if not owner_record:
+        return False, "owner_not_found", "해당 정원사를 찾을 수 없어요.", ""
+
+    owner_user_id = str(owner_record.get("user_id", ""))
+    if requester_user_id == owner_user_id:
+        return False, "cannot_steal_self", "내 꽃밭에서는 서리할 수 없어요.", ""
+
+    if get_friend_status(requester_user_id, owner_user_id) != "friends":
+        return False, "friends_only", "친구의 꽃밭에서만 서리할 수 있어요.", ""
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT plots
+                    FROM gardener_garden_snapshots
+                    WHERE owner_user_id = %s
+                    FOR UPDATE
+                    """,
+                    (owner_user_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False, "garden_not_synced", "친구 꽃밭 정보가 아직 없어요.", ""
+
+                raw_plots = row[0]
+                if isinstance(raw_plots, str):
+                    raw_plots = json.loads(raw_plots)
+                plots = sanitize_garden_plots(raw_plots) or []
+
+                target = None
+                for plot in plots:
+                    if str(plot.get("area_id", "")) == area_id:
+                        target = plot
+                        break
+
+                if not target:
+                    return False, "plot_not_found", "해당 꽃밭을 찾을 수 없어요.", ""
+
+                if (
+                    not bool(target.get("unlocked", False))
+                    or not bool(target.get("fully_grown", False))
+                    or int(target.get("stage", 0)) < 4
+                    or not str(target.get("flower_id", ""))
+                ):
+                    return False, "not_bloomed", "지금은 서리할 만개 꽃이 없어요.", ""
+
+                current_bloom_id = str(target.get("bloom_id", ""))
+                if not current_bloom_id or current_bloom_id != bloom_id:
+                    return False, "bloom_changed", "꽃밭 상태가 바뀌었어요. 다시 확인해주세요.", ""
+
+                flower_id = str(target.get("flower_id", ""))
+
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO gardener_garden_steals (
+                            requester_user_id,
+                            owner_user_id,
+                            area_id,
+                            bloom_id,
+                            flower_id,
+                            created_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, NOW())
+                        """,
+                        (
+                            requester_user_id,
+                            owner_user_id,
+                            area_id,
+                            bloom_id,
+                            flower_id,
+                        ),
+                    )
+                except psycopg_errors.UniqueViolation:
+                    conn.rollback()
+                    return False, "already_stolen", "이 만개 꽃은 이미 서리했어요.", ""
+
+            conn.commit()
+
+        return True, "ok", "서리 성공! 창고에 꽃 1개가 추가돼요.", flower_id
+
+    except Exception as exc:
+        print(f"[꽃밭 서리 오류] {type(exc).__name__}: {exc}")
+        return False, "garden_db_error", "서리하지 못했어요. 잠시 후 다시 시도해주세요.", ""
+
 def format_guestbook_time(value) -> str:
     try:
         dt = value.astimezone(KST)
@@ -1181,6 +1521,83 @@ async def handle_guestbook_delete(ws, payload: dict):
     })
 
 
+async def handle_garden_sync(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    ok, code, message = save_garden_snapshot(
+        str(state.get("account_user_id", "")),
+        payload.get("plots", []),
+    )
+    await send_json(ws, {
+        "type": "garden_sync_result",
+        "ok": ok,
+        "code": code,
+        "message": message,
+    })
+
+
+async def handle_garden_load(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    owner_number = str(payload.get("garden_number", "")).strip()
+    data, error_code = load_garden_snapshot(
+        str(state.get("account_user_id", "")),
+        owner_number,
+    )
+
+    if error_code:
+        if error_code == "friends_only":
+            message = "친구의 꽃밭만 볼 수 있어요."
+        elif error_code == "owner_not_found":
+            message = "해당 정원사를 찾을 수 없어요."
+        else:
+            message = "친구 꽃밭을 불러오지 못했어요. 잠시 후 다시 시도해주세요."
+        await send_json(ws, {
+            "type": "garden_load_result",
+            "ok": False,
+            "code": error_code,
+            "message": message,
+        })
+        return
+
+    await send_json(ws, {
+        "type": "garden_load_result",
+        "ok": True,
+        **data,
+    })
+
+
+async def handle_garden_steal(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    owner_number = str(payload.get("garden_number", "")).strip()
+    area_id = str(payload.get("area_id", "")).strip()
+    bloom_id = str(payload.get("bloom_id", "")).strip()
+
+    ok, code, message, flower_id = steal_garden_flower(
+        str(state.get("account_user_id", "")),
+        owner_number,
+        area_id,
+        bloom_id,
+    )
+    await send_json(ws, {
+        "type": "garden_steal_result",
+        "ok": ok,
+        "code": code,
+        "message": message,
+        "garden_number": owner_number,
+        "area_id": area_id,
+        "bloom_id": bloom_id,
+        "flower_id": flower_id,
+    })
+
+
 async def handle_chat_message(ws, payload: dict):
     global message_sequence
 
@@ -1774,6 +2191,15 @@ async def handle_client(ws):
 
             elif msg_type == "guestbook_delete":
                 await handle_guestbook_delete(ws, payload)
+
+            elif msg_type == "garden_sync":
+                await handle_garden_sync(ws, payload)
+
+            elif msg_type == "garden_load":
+                await handle_garden_load(ws, payload)
+
+            elif msg_type == "garden_steal":
+                await handle_garden_steal(ws, payload)
 
             elif msg_type == "message":
                 await handle_chat_message(ws, payload)
