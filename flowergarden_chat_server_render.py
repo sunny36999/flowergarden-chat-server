@@ -1,7 +1,9 @@
+# FlowerGarden Render server v8 - account/friends/guestbook/garden steal/flower gifts
 # FlowerGarden Render server v7 - 친구 꽃밭 보기/서리 + 기존 계정/친구/방명록/광장 유지
 import asyncio
 import json
 import os
+import re
 import socket
 import time
 from collections import deque
@@ -183,6 +185,31 @@ def ensure_account_db() -> bool:
                         owner_user_id,
                         area_id,
                         bloom_id
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_flower_gifts (
+                        gift_id BIGSERIAL PRIMARY KEY,
+                        sender_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        receiver_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        flower_id VARCHAR(100) NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        claimed_at TIMESTAMPTZ NULL,
+                        CHECK (sender_user_id <> receiver_user_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_flower_gifts_receiver_pending
+                    ON gardener_flower_gifts (
+                        receiver_user_id,
+                        claimed_at,
+                        created_at DESC
                     )
                     """
                 )
@@ -871,6 +898,153 @@ def steal_garden_flower(
     except Exception as exc:
         print(f"[꽃밭 서리 오류] {type(exc).__name__}: {exc}")
         return False, "garden_db_error", "서리하지 못했어요. 잠시 후 다시 시도해주세요.", ""
+
+
+def is_valid_gift_flower_id(flower_id: str) -> bool:
+    flower_id = str(flower_id).strip()
+    if not flower_id or len(flower_id) > 100:
+        return False
+    return re.fullmatch(r"[A-Za-z0-9_-]+", flower_id) is not None
+
+
+def send_flower_gift(
+    sender_user_id: str,
+    receiver_garden_number: str,
+    flower_id: str,
+):
+    flower_id = str(flower_id).strip()
+    if not is_valid_gift_flower_id(flower_id):
+        return False, "invalid_flower", "선물할 꽃을 확인할 수 없어요.", 0, ""
+
+    receiver, lookup_error = lookup_account_record(receiver_garden_number)
+    if lookup_error:
+        return False, lookup_error, "계정 저장소에 연결하지 못했어요.", 0, ""
+    if not receiver:
+        return False, "receiver_not_found", "해당 정원사를 찾을 수 없어요.", 0, ""
+
+    receiver_user_id = str(receiver.get("user_id", ""))
+    if sender_user_id == receiver_user_id:
+        return False, "cannot_gift_self", "나에게는 꽃을 선물할 수 없어요.", 0, ""
+
+    if get_friend_status(sender_user_id, receiver_user_id) != "friends":
+        return False, "friends_only", "친구에게만 꽃을 선물할 수 있어요.", 0, ""
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO gardener_flower_gifts (
+                        sender_user_id,
+                        receiver_user_id,
+                        flower_id,
+                        created_at
+                    )
+                    VALUES (%s, %s, %s, NOW())
+                    RETURNING gift_id
+                    """,
+                    (sender_user_id, receiver_user_id, flower_id),
+                )
+                row = cur.fetchone()
+                gift_id = int(row[0]) if row else 0
+            conn.commit()
+
+        return (
+            True,
+            "ok",
+            "꽃 선물을 보냈어요.",
+            gift_id,
+            str(receiver.get("nickname", "정원사")),
+        )
+    except Exception as exc:
+        print(f"[꽃 선물 보내기 오류] {type(exc).__name__}: {exc}")
+        return False, "gift_db_error", "선물을 보내지 못했어요. 잠시 후 다시 시도해주세요.", 0, ""
+
+
+def load_flower_gift_inbox(receiver_user_id: str):
+    gifts = []
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT g.gift_id,
+                           g.flower_id,
+                           a.nickname,
+                           a.garden_number,
+                           g.created_at
+                    FROM gardener_flower_gifts g
+                    JOIN gardener_accounts a
+                      ON a.user_id = g.sender_user_id
+                    WHERE g.receiver_user_id = %s
+                      AND g.claimed_at IS NULL
+                    ORDER BY g.created_at DESC, g.gift_id DESC
+                    LIMIT 100
+                    """,
+                    (receiver_user_id,),
+                )
+                for row in cur.fetchall():
+                    gifts.append({
+                        "gift_id": int(row[0]),
+                        "flower_id": str(row[1]),
+                        "sender_nickname": str(row[2]),
+                        "sender_garden_number": str(row[3]).strip(),
+                        "time_text": format_guestbook_time(row[4]),
+                    })
+        return gifts, ""
+    except Exception as exc:
+        print(f"[받은 꽃 선물 불러오기 오류] {type(exc).__name__}: {exc}")
+        return [], "gift_db_error"
+
+
+def claim_flower_gift(receiver_user_id: str, gift_id: int):
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT g.receiver_user_id,
+                           g.flower_id,
+                           g.claimed_at,
+                           a.nickname
+                    FROM gardener_flower_gifts g
+                    JOIN gardener_accounts a
+                      ON a.user_id = g.sender_user_id
+                    WHERE g.gift_id = %s
+                    FOR UPDATE
+                    """,
+                    (gift_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False, "gift_not_found", "해당 선물을 찾을 수 없어요.", "", ""
+
+                gift_receiver_user_id = str(row[0])
+                flower_id = str(row[1])
+                claimed_at = row[2]
+                sender_nickname = str(row[3])
+
+                if gift_receiver_user_id != receiver_user_id:
+                    return False, "not_receiver", "내 선물만 받을 수 있어요.", "", ""
+
+                if claimed_at is not None:
+                    return False, "already_claimed", "이미 받은 선물이에요.", "", ""
+
+                cur.execute(
+                    """
+                    UPDATE gardener_flower_gifts
+                    SET claimed_at = NOW()
+                    WHERE gift_id = %s
+                    """,
+                    (gift_id,),
+                )
+            conn.commit()
+
+        return True, "ok", "선물을 받았어요.", flower_id, sender_nickname
+    except Exception as exc:
+        print(f"[꽃 선물 받기 오류] {type(exc).__name__}: {exc}")
+        return False, "gift_db_error", "선물을 받지 못했어요. 잠시 후 다시 시도해주세요.", "", ""
+
 
 def format_guestbook_time(value) -> str:
     try:
@@ -1598,6 +1772,95 @@ async def handle_garden_steal(ws, payload: dict):
     })
 
 
+
+async def handle_gift_send(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    receiver_number = str(payload.get("garden_number", "")).strip()
+    flower_id = str(payload.get("flower_id", "")).strip()
+
+    ok, code, message, gift_id, receiver_nickname = send_flower_gift(
+        str(state.get("account_user_id", "")),
+        receiver_number,
+        flower_id,
+    )
+    await send_json(ws, {
+        "type": "gift_send_result",
+        "ok": ok,
+        "code": code,
+        "message": message,
+        "gift_id": gift_id,
+        "garden_number": receiver_number,
+        "receiver_nickname": receiver_nickname,
+        "flower_id": flower_id,
+    })
+
+
+async def handle_gift_inbox(ws, _payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    gifts, error_code = load_flower_gift_inbox(
+        str(state.get("account_user_id", ""))
+    )
+    if error_code:
+        await send_json(ws, {
+            "type": "gift_inbox_result",
+            "ok": False,
+            "code": error_code,
+            "message": "받은 선물을 불러오지 못했어요. 잠시 후 다시 시도해주세요.",
+            "gifts": [],
+        })
+        return
+
+    await send_json(ws, {
+        "type": "gift_inbox_result",
+        "ok": True,
+        "code": "ok",
+        "message": "",
+        "gifts": gifts,
+    })
+
+
+async def handle_gift_claim(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    try:
+        gift_id = int(payload.get("gift_id", 0))
+    except (TypeError, ValueError):
+        gift_id = 0
+
+    if gift_id <= 0:
+        await send_json(ws, {
+            "type": "gift_claim_result",
+            "ok": False,
+            "code": "invalid_gift_id",
+            "message": "받을 선물을 확인할 수 없어요.",
+            "gift_id": gift_id,
+            "flower_id": "",
+        })
+        return
+
+    ok, code, message, flower_id, sender_nickname = claim_flower_gift(
+        str(state.get("account_user_id", "")),
+        gift_id,
+    )
+    await send_json(ws, {
+        "type": "gift_claim_result",
+        "ok": ok,
+        "code": code,
+        "message": message,
+        "gift_id": gift_id,
+        "flower_id": flower_id,
+        "sender_nickname": sender_nickname,
+    })
+
+
 async def handle_chat_message(ws, payload: dict):
     global message_sequence
 
@@ -2200,6 +2463,15 @@ async def handle_client(ws):
 
             elif msg_type == "garden_steal":
                 await handle_garden_steal(ws, payload)
+
+            elif msg_type == "gift_send":
+                await handle_gift_send(ws, payload)
+
+            elif msg_type == "gift_inbox":
+                await handle_gift_inbox(ws, payload)
+
+            elif msg_type == "gift_claim":
+                await handle_gift_claim(ws, payload)
 
             elif msg_type == "message":
                 await handle_chat_message(ws, payload)
