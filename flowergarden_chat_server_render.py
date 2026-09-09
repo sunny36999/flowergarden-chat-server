@@ -99,6 +99,32 @@ def ensure_account_db() -> bool:
                     )
                     """
                 )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_friend_requests (
+                        requester_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        target_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (requester_user_id, target_user_id),
+                        CHECK (requester_user_id <> target_user_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_friendships (
+                        user_id_a VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        user_id_b VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (user_id_a, user_id_b),
+                        CHECK (user_id_a < user_id_b)
+                    )
+                    """
+                )
             conn.commit()
         return True
     except Exception as exc:
@@ -279,6 +305,207 @@ def register_account_record(
             "account_db_error",
             "계정 저장 서버에 잠시 문제가 있어요.",
         )
+
+
+
+def get_friend_status(user_id: str, target_user_id: str) -> str:
+    if not user_id or not target_user_id:
+        return "none"
+    if user_id == target_user_id:
+        return "self"
+    if not DATABASE_URL:
+        return "none"
+
+    user_a, user_b = sorted([user_id, target_user_id])
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM gardener_friendships
+                    WHERE user_id_a = %s AND user_id_b = %s
+                    """,
+                    (user_a, user_b),
+                )
+                if cur.fetchone():
+                    return "friends"
+
+                cur.execute(
+                    """
+                    SELECT requester_user_id, target_user_id
+                    FROM gardener_friend_requests
+                    WHERE (requester_user_id = %s AND target_user_id = %s)
+                       OR (requester_user_id = %s AND target_user_id = %s)
+                    LIMIT 1
+                    """,
+                    (user_id, target_user_id, target_user_id, user_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return "none"
+                if str(row[0]) == user_id:
+                    return "outgoing"
+                return "incoming"
+    except Exception as exc:
+        print(f"[친구 상태 오류] {type(exc).__name__}: {exc}")
+        return "none"
+
+
+def create_friend_request(user_id: str, target_garden_number: str):
+    target, lookup_error = lookup_account_record(target_garden_number)
+    if lookup_error:
+        return False, "account_db_error", "계정 저장소에 잠시 문제가 있어요.", "none"
+    if not target:
+        return False, "target_not_found", "해당 정원사를 찾을 수 없어요.", "none"
+
+    target_user_id = str(target.get("user_id", ""))
+    if target_user_id == user_id:
+        return False, "self_request", "내 정원에는 친구 요청을 보낼 수 없어요.", "self"
+
+    status = get_friend_status(user_id, target_user_id)
+    if status == "friends":
+        return True, "already_friends", "이미 친구인 정원사예요.", "friends"
+    if status == "outgoing":
+        return True, "already_requested", "이미 친구 요청을 보냈어요.", "outgoing"
+    if status == "incoming":
+        return False, "incoming_request", "상대 정원사가 이미 친구 요청을 보냈어요. 받은 요청에서 확인해주세요.", "incoming"
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO gardener_friend_requests (
+                        requester_user_id,
+                        target_user_id,
+                        created_at
+                    ) VALUES (%s, %s, NOW())
+                    ON CONFLICT (requester_user_id, target_user_id) DO NOTHING
+                    """,
+                    (user_id, target_user_id),
+                )
+            conn.commit()
+        return True, "requested", "친구 요청을 보냈어요.", "outgoing"
+    except Exception as exc:
+        print(f"[친구 요청 저장 오류] {type(exc).__name__}: {exc}")
+        return False, "friend_db_error", "친구 요청을 저장하지 못했어요.", "none"
+
+
+def get_friend_lists(user_id: str):
+    friends = []
+    incoming = []
+    if not DATABASE_URL:
+        return friends, incoming, "account_db_unavailable"
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT a.nickname, a.garden_number, a.level
+                    FROM gardener_friendships f
+                    JOIN gardener_accounts a
+                      ON a.user_id = CASE
+                          WHEN f.user_id_a = %s THEN f.user_id_b
+                          ELSE f.user_id_a
+                      END
+                    WHERE f.user_id_a = %s OR f.user_id_b = %s
+                    ORDER BY LOWER(a.nickname), a.garden_number
+                    """,
+                    (user_id, user_id, user_id),
+                )
+                for row in cur.fetchall():
+                    friends.append({
+                        "nickname": str(row[0]),
+                        "garden_number": str(row[1]).strip(),
+                        "level": int(row[2]),
+                    })
+
+                cur.execute(
+                    """
+                    SELECT a.nickname, a.garden_number, a.level
+                    FROM gardener_friend_requests r
+                    JOIN gardener_accounts a
+                      ON a.user_id = r.requester_user_id
+                    WHERE r.target_user_id = %s
+                    ORDER BY r.created_at DESC
+                    """,
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    incoming.append({
+                        "nickname": str(row[0]),
+                        "garden_number": str(row[1]).strip(),
+                        "level": int(row[2]),
+                    })
+        return friends, incoming, ""
+    except Exception as exc:
+        print(f"[친구 목록 오류] {type(exc).__name__}: {exc}")
+        return [], [], "friend_db_error"
+
+
+def respond_friend_request(user_id: str, requester_garden_number: str, accept: bool):
+    requester, lookup_error = lookup_account_record(requester_garden_number)
+    if lookup_error:
+        return False, "account_db_error", "계정 저장소에 잠시 문제가 있어요."
+    if not requester:
+        return False, "requester_not_found", "친구 요청을 보낸 정원사를 찾을 수 없어요."
+
+    requester_user_id = str(requester.get("user_id", ""))
+    if requester_user_id == user_id:
+        return False, "invalid_request", "잘못된 친구 요청이에요."
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM gardener_friend_requests
+                    WHERE requester_user_id = %s AND target_user_id = %s
+                    """,
+                    (requester_user_id, user_id),
+                )
+                if not cur.fetchone():
+                    return False, "request_not_found", "이미 처리되었거나 없는 친구 요청이에요."
+
+                cur.execute(
+                    """
+                    DELETE FROM gardener_friend_requests
+                    WHERE requester_user_id = %s AND target_user_id = %s
+                    """,
+                    (requester_user_id, user_id),
+                )
+
+                if accept:
+                    user_a, user_b = sorted([user_id, requester_user_id])
+                    cur.execute(
+                        """
+                        INSERT INTO gardener_friendships (
+                            user_id_a, user_id_b, created_at
+                        ) VALUES (%s, %s, NOW())
+                        ON CONFLICT (user_id_a, user_id_b) DO NOTHING
+                        """,
+                        (user_a, user_b),
+                    )
+                    # 양방향으로 남은 중복 요청이 있다면 정리합니다.
+                    cur.execute(
+                        """
+                        DELETE FROM gardener_friend_requests
+                        WHERE (requester_user_id = %s AND target_user_id = %s)
+                           OR (requester_user_id = %s AND target_user_id = %s)
+                        """,
+                        (user_id, requester_user_id, requester_user_id, user_id),
+                    )
+            conn.commit()
+
+        if accept:
+            return True, "accepted", "친구가 되었어요!"
+        return True, "declined", "친구 요청을 거절했어요."
+    except Exception as exc:
+        print(f"[친구 요청 처리 오류] {type(exc).__name__}: {exc}")
+        return False, "friend_db_error", "친구 요청을 처리하지 못했어요."
 
 
 def local_ipv4_candidates():
@@ -524,6 +751,12 @@ async def handle_account_register(ws, payload: dict):
     )
 
     if ok:
+        state = clients[ws]
+        state["account_registered"] = True
+        state["account_user_id"] = user_id
+        state["garden_number"] = garden_number
+        state["nickname"] = nickname
+        state["level"] = level
         print(
             f"[계정등록] {nickname} / "
             f"정원번호 {garden_number} / {user_id}"
@@ -588,6 +821,14 @@ async def handle_account_lookup(ws, payload: dict):
         )
         return
 
+    requester_user_id = str(state.get("account_user_id", ""))
+    target_user_id = str(record.get("user_id", ""))
+    friend_status = (
+        get_friend_status(requester_user_id, target_user_id)
+        if requester_user_id
+        else "none"
+    )
+
     await send_json(
         ws,
         {
@@ -596,6 +837,95 @@ async def handle_account_lookup(ws, payload: dict):
             "nickname": record.get("nickname", "정원사"),
             "garden_number": garden_number,
             "level": int(record.get("level", 0)),
+            "friend_status": friend_status,
+        },
+    )
+
+
+async def require_registered_account(ws):
+    state = clients[ws]
+    if state.get("account_registered") and state.get("account_user_id"):
+        return True
+    await send_json(
+        ws,
+        {
+            "type": "error",
+            "code": "account_registration_required",
+            "message": "먼저 정원사 계정 정보를 서버에 등록해주세요.",
+        },
+    )
+    return False
+
+
+async def handle_friend_request(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    garden_number = str(payload.get("garden_number", "")).strip()
+    ok, code, message, status = create_friend_request(
+        str(state.get("account_user_id", "")),
+        garden_number,
+    )
+    await send_json(
+        ws,
+        {
+            "type": "friend_request_result",
+            "ok": ok,
+            "code": code,
+            "message": message,
+            "garden_number": garden_number,
+            "friend_status": status,
+        },
+    )
+
+
+async def handle_friend_list(ws, _payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    friends, incoming, error_code = get_friend_lists(
+        str(state.get("account_user_id", ""))
+    )
+    if error_code:
+        await send_json(
+            ws,
+            {
+                "type": "error",
+                "code": error_code,
+                "message": "친구 목록을 불러오지 못했어요. 잠시 후 다시 시도해주세요.",
+            },
+        )
+        return
+    await send_json(
+        ws,
+        {
+            "type": "friend_list_result",
+            "friends": friends,
+            "incoming_requests": incoming,
+        },
+    )
+
+
+async def handle_friend_response(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    requester_number = str(payload.get("garden_number", "")).strip()
+    accept = bool(payload.get("accept", False))
+    ok, code, message = respond_friend_request(
+        str(state.get("account_user_id", "")),
+        requester_number,
+        accept,
+    )
+    await send_json(
+        ws,
+        {
+            "type": "friend_response_result",
+            "ok": ok,
+            "code": code,
+            "message": message,
+            "garden_number": requester_number,
+            "accepted": accept and ok,
         },
     )
 
@@ -1134,6 +1464,8 @@ async def handle_client(ws):
         "user_id": "",
         "level": 0,
         "garden_number": "",
+        "account_registered": False,
+        "account_user_id": "",
         "last_account_lookup": 0.0,
     }
 
@@ -1173,6 +1505,15 @@ async def handle_client(ws):
 
             elif msg_type == "account_lookup":
                 await handle_account_lookup(ws, payload)
+
+            elif msg_type == "friend_request":
+                await handle_friend_request(ws, payload)
+
+            elif msg_type == "friend_list":
+                await handle_friend_list(ws, payload)
+
+            elif msg_type == "friend_response":
+                await handle_friend_response(ws, payload)
 
             elif msg_type == "message":
                 await handle_chat_message(ws, payload)
@@ -1217,7 +1558,7 @@ async def main():
     account_db_ready = ensure_account_db()
 
     print("=" * 60)
-    print(" FlowerGarden 정원사 광장 + 영구계정 Render 서버 v4")
+    print(" FlowerGarden 정원사 광장 + 영구계정 + 친구 Render 서버 v5")
     print("=" * 60)
     print(f"Render 서버 포트: {PORT}")
     if account_db_ready:
