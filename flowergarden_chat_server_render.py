@@ -15,6 +15,15 @@ MIN_CHAT_LEVEL = 5
 MAX_HISTORY = 50
 MAX_MESSAGE_LENGTH = 100
 
+# 계정 시스템 3차 - 정원번호 검색용 간단 계정 저장소
+# Render 무료 웹서비스의 로컬 파일은 재배포/재시작 정책에 따라 영구 보존이 보장되지 않습니다.
+# 현재 단계는 기능 테스트용이며, 정식 계정 복구/영구 저장은 외부 DB로 이전해야 합니다.
+ACCOUNT_DB_PATH = os.environ.get(
+    "FLOWERGARDEN_ACCOUNT_DB",
+    "flowergarden_accounts.json",
+)
+ACCOUNT_LOOKUP_COOLDOWN_SECONDS = 1.0
+
 # 신고 정책
 REPORT_WINDOW_SECONDS = 10 * 60
 REPORT_THRESHOLD = 3
@@ -42,6 +51,12 @@ banned_until_by_user = {}
 # target_user_id -> {reporter_user_id: monotonic_report_time}
 report_votes = {}
 
+# 계정 시스템 3차
+# garden_number -> {user_id, nickname, garden_number, level, updated_at}
+accounts_by_number = {}
+# user_id -> garden_number
+account_number_by_user = {}
+
 
 def now_kst_iso() -> str:
     return datetime.now(KST).isoformat(timespec="seconds")
@@ -54,6 +69,157 @@ def normalize_for_filter(text: str) -> str:
 def contains_blocked_word(text: str) -> bool:
     normalized = normalize_for_filter(text)
     return any(word in normalized for word in BLOCKED_WORDS)
+
+
+def is_valid_garden_number(value: str) -> bool:
+    return len(value) == 6 and value.isdigit()
+
+
+def load_account_db():
+    accounts_by_number.clear()
+    account_number_by_user.clear()
+
+    try:
+        with open(ACCOUNT_DB_PATH, "r", encoding="utf-8") as fp:
+            raw = json.load(fp)
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        print(
+            "[계정 DB 읽기 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return
+
+    if isinstance(raw, dict) and isinstance(raw.get("accounts"), dict):
+        raw_accounts = raw.get("accounts", {})
+    elif isinstance(raw, dict):
+        raw_accounts = raw
+    else:
+        raw_accounts = {}
+
+    for garden_number, item in raw_accounts.items():
+        if not isinstance(item, dict):
+            continue
+
+        garden_number = str(garden_number).strip()
+        user_id = str(item.get("user_id", "")).strip()
+        nickname = str(item.get("nickname", "")).strip()
+
+        if not is_valid_garden_number(garden_number):
+            continue
+        if not user_id or len(user_id) > 80:
+            continue
+        if not (2 <= len(nickname) <= 12):
+            continue
+
+        try:
+            level = max(0, int(item.get("level", 0)))
+        except (TypeError, ValueError):
+            level = 0
+
+        record = {
+            "user_id": user_id,
+            "nickname": nickname,
+            "garden_number": garden_number,
+            "level": level,
+            "updated_at": str(item.get("updated_at", "")),
+        }
+
+        accounts_by_number[garden_number] = record
+        account_number_by_user[user_id] = garden_number
+
+
+def save_account_db():
+    payload = {
+        "version": 1,
+        "accounts": accounts_by_number,
+    }
+
+    directory = os.path.dirname(os.path.abspath(ACCOUNT_DB_PATH))
+    temp_path = ACCOUNT_DB_PATH + ".tmp"
+
+    try:
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(temp_path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=False, indent=2)
+        os.replace(temp_path, ACCOUNT_DB_PATH)
+    except Exception as exc:
+        print(
+            "[계정 DB 저장 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def register_account_record(
+    nickname: str,
+    user_id: str,
+    garden_number: str,
+    level: int,
+):
+    nickname = str(nickname).strip()
+    user_id = str(user_id).strip()
+    garden_number = str(garden_number).strip()
+
+    if not user_id or len(user_id) > 80:
+        return False, "invalid_user_id", "사용자 정보를 확인할 수 없어요."
+
+    if (
+        "\n" in nickname
+        or "\r" in nickname
+        or not (2 <= len(nickname) <= 12)
+    ):
+        return False, "invalid_nickname", "닉네임은 2~12글자로 입력해주세요."
+
+    if contains_blocked_word(nickname):
+        return False, "blocked_nickname", "사용할 수 없는 닉네임이에요."
+
+    if not is_valid_garden_number(garden_number):
+        return False, "invalid_garden_number", "정원번호 6자리를 확인해주세요."
+
+    old_number = account_number_by_user.get(user_id)
+    if old_number and old_number != garden_number:
+        return (
+            False,
+            "garden_number_locked",
+            "이 정원사의 정원번호는 이미 다른 번호로 등록되어 있어요.",
+        )
+
+    existing = accounts_by_number.get(garden_number)
+    if existing and existing.get("user_id") != user_id:
+        return (
+            False,
+            "garden_number_conflict",
+            "이 정원번호가 다른 정원사와 겹쳤어요. 운영자에게 알려주세요.",
+        )
+
+    try:
+        level = max(0, int(level))
+    except (TypeError, ValueError):
+        level = 0
+
+    new_record = {
+        "user_id": user_id,
+        "nickname": nickname,
+        "garden_number": garden_number,
+        "level": level,
+        "updated_at": now_kst_iso(),
+    }
+
+    changed = existing != new_record
+    accounts_by_number[garden_number] = new_record
+    account_number_by_user[user_id] = garden_number
+
+    if changed:
+        save_account_db()
+
+    return True, "ok", "정원사 정보가 등록되었어요."
 
 
 def local_ipv4_candidates():
@@ -136,6 +302,7 @@ async def broadcast_presence():
 def validate_join(payload: dict):
     nickname = str(payload.get("nickname", "")).strip()
     user_id = str(payload.get("user_id", "")).strip()
+    garden_number = str(payload.get("garden_number", "")).strip()
 
     try:
         level = int(payload.get("level", 0))
@@ -194,6 +361,7 @@ def validate_join(payload: dict):
             "nickname": nickname,
             "user_id": user_id,
             "level": level,
+            "garden_number": garden_number,
         },
         "",
     )
@@ -229,6 +397,19 @@ async def handle_join(ws, payload: dict):
     state.update(data)
     state["joined"] = True
 
+    if is_valid_garden_number(state.get("garden_number", "")):
+        account_ok, account_code, account_message = register_account_record(
+            state["nickname"],
+            state["user_id"],
+            state["garden_number"],
+            state["level"],
+        )
+        if not account_ok:
+            print(
+                "[광장 계정등록 경고] "
+                f"{account_code}: {account_message}"
+            )
+
     mute_remaining = remaining_seconds(
         muted_until_by_user,
         state["user_id"],
@@ -252,6 +433,96 @@ async def handle_join(ws, payload: dict):
     print(
         f"[입장] {state['nickname']} / "
         f"Lv.{state['level']} / {state['user_id']}"
+    )
+
+
+async def handle_account_register(ws, payload: dict):
+    nickname = str(payload.get("nickname", "")).strip()
+    user_id = str(payload.get("user_id", "")).strip()
+    garden_number = str(payload.get("garden_number", "")).strip()
+
+    try:
+        level = int(payload.get("level", 0))
+    except (TypeError, ValueError):
+        level = 0
+
+    ok, code, message = register_account_record(
+        nickname,
+        user_id,
+        garden_number,
+        level,
+    )
+
+    await send_json(
+        ws,
+        {
+            "type": "account_register_result",
+            "ok": ok,
+            "code": code,
+            "message": message,
+            "garden_number": garden_number,
+        },
+    )
+
+    if ok:
+        print(
+            f"[계정등록] {nickname} / "
+            f"정원번호 {garden_number} / {user_id}"
+        )
+
+
+async def handle_account_lookup(ws, payload: dict):
+    state = clients[ws]
+    now = time.monotonic()
+    last_lookup = float(state.get("last_account_lookup", 0.0))
+
+    if now - last_lookup < ACCOUNT_LOOKUP_COOLDOWN_SECONDS:
+        await send_json(
+            ws,
+            {
+                "type": "error",
+                "code": "lookup_too_fast",
+                "message": "정원사 찾기는 잠시 후 다시 이용해주세요.",
+            },
+        )
+        return
+
+    state["last_account_lookup"] = now
+    garden_number = str(payload.get("garden_number", "")).strip()
+
+    if not is_valid_garden_number(garden_number):
+        await send_json(
+            ws,
+            {
+                "type": "account_lookup_result",
+                "found": False,
+                "code": "invalid_garden_number",
+                "message": "정원번호 6자리를 확인해주세요.",
+            },
+        )
+        return
+
+    record = accounts_by_number.get(garden_number)
+    if not record:
+        await send_json(
+            ws,
+            {
+                "type": "account_lookup_result",
+                "found": False,
+                "garden_number": garden_number,
+            },
+        )
+        return
+
+    await send_json(
+        ws,
+        {
+            "type": "account_lookup_result",
+            "found": True,
+            "nickname": record.get("nickname", "정원사"),
+            "garden_number": garden_number,
+            "level": int(record.get("level", 0)),
+        },
     )
 
 
@@ -788,6 +1059,8 @@ async def handle_client(ws):
         "nickname": "",
         "user_id": "",
         "level": 0,
+        "garden_number": "",
+        "last_account_lookup": 0.0,
     }
 
     try:
@@ -820,6 +1093,12 @@ async def handle_client(ws):
 
             if msg_type == "join":
                 await handle_join(ws, payload)
+
+            elif msg_type == "account_register":
+                await handle_account_register(ws, payload)
+
+            elif msg_type == "account_lookup":
+                await handle_account_lookup(ws, payload)
 
             elif msg_type == "message":
                 await handle_chat_message(ws, payload)
@@ -861,10 +1140,14 @@ async def handle_client(ws):
 
 
 async def main():
+    load_account_db()
+
     print("=" * 60)
-    print(" FlowerGarden 정원사 광장 - 운영 기능 테스트 서버 v2")
+    print(" FlowerGarden 정원사 광장 + 계정찾기 Render 서버 v3")
     print("=" * 60)
-    print(f"서버 포트: {PORT}")
+    print(f"Render 서버 포트: {PORT}")
+    print(f"등록된 정원사 계정: {len(accounts_by_number)}명")
+    print(f"계정 DB: {os.path.abspath(ACCOUNT_DB_PATH)}")
 
     ips = local_ipv4_candidates()
 
