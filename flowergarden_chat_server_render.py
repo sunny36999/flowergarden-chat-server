@@ -125,6 +125,25 @@ def ensure_account_db() -> bool:
                     )
                     """
                 )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_guestbook_entries (
+                        entry_id BIGSERIAL PRIMARY KEY,
+                        owner_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        author_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        message VARCHAR(60) NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_guestbook_owner_created
+                    ON gardener_guestbook_entries (owner_user_id, created_at DESC)
+                    """
+                )
             conn.commit()
         return True
     except Exception as exc:
@@ -506,6 +525,158 @@ def respond_friend_request(user_id: str, requester_garden_number: str, accept: b
     except Exception as exc:
         print(f"[친구 요청 처리 오류] {type(exc).__name__}: {exc}")
         return False, "friend_db_error", "친구 요청을 처리하지 못했어요."
+
+
+# ==================================================
+# 📖 방명록 1차 - Neon 영구저장
+# 읽기는 모든 등록 정원사, 작성은 친구만 가능합니다.
+# 작성자는 자기 글을 삭제할 수 있고, 방명록 주인은 자기 방명록의 모든 글을 삭제할 수 있습니다.
+# ==================================================
+def format_guestbook_time(value) -> str:
+    try:
+        dt = value.astimezone(KST)
+        period = "오전" if dt.hour < 12 else "오후"
+        hour = dt.hour % 12
+        if hour == 0:
+            hour = 12
+        return f"{dt.month}월 {dt.day}일 {period} {hour}:{dt.minute:02d}"
+    except Exception:
+        return ""
+
+
+def load_guestbook(user_id: str, owner_garden_number: str):
+    owner, lookup_error = lookup_account_record(owner_garden_number)
+    if lookup_error:
+        return None, "account_db_error"
+    if not owner:
+        return None, "owner_not_found"
+
+    owner_user_id = str(owner.get("user_id", ""))
+    can_write = get_friend_status(user_id, owner_user_id) == "friends"
+    is_owner = user_id == owner_user_id
+    entries = []
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT g.entry_id,
+                           g.author_user_id,
+                           a.nickname,
+                           a.garden_number,
+                           g.message,
+                           g.created_at
+                    FROM gardener_guestbook_entries g
+                    JOIN gardener_accounts a
+                      ON a.user_id = g.author_user_id
+                    WHERE g.owner_user_id = %s
+                    ORDER BY g.created_at DESC, g.entry_id DESC
+                    LIMIT 50
+                    """,
+                    (owner_user_id,),
+                )
+                for row in cur.fetchall():
+                    author_user_id = str(row[1])
+                    entries.append({
+                        "entry_id": int(row[0]),
+                        "author_nickname": str(row[2]),
+                        "author_garden_number": str(row[3]).strip(),
+                        "message": str(row[4]),
+                        "time_text": format_guestbook_time(row[5]),
+                        "can_delete": (
+                            user_id == author_user_id
+                            or user_id == owner_user_id
+                        ),
+                    })
+    except Exception as exc:
+        print(f"[방명록 불러오기 오류] {type(exc).__name__}: {exc}")
+        return None, "guestbook_db_error"
+
+    return {
+        "owner_nickname": str(owner.get("nickname", "정원사")),
+        "owner_garden_number": owner_garden_number,
+        "can_write": can_write,
+        "is_owner": is_owner,
+        "entries": entries,
+    }, ""
+
+
+def post_guestbook_entry(user_id: str, owner_garden_number: str, message: str):
+    owner, lookup_error = lookup_account_record(owner_garden_number)
+    if lookup_error:
+        return False, "account_db_error", "계정 저장소에 잠시 문제가 있어요."
+    if not owner:
+        return False, "owner_not_found", "해당 정원사를 찾을 수 없어요."
+
+    owner_user_id = str(owner.get("user_id", ""))
+    if owner_user_id == user_id:
+        return False, "self_write", "내 방명록에는 직접 글을 남길 수 없어요."
+
+    if get_friend_status(user_id, owner_user_id) != "friends":
+        return False, "friends_only", "친구에게만 방명록을 남길 수 있어요."
+
+    clean_message = str(message).strip()
+    if not clean_message:
+        return False, "empty_message", "방명록 내용을 입력해주세요."
+    if len(clean_message) > 60:
+        return False, "message_too_long", "방명록은 60자까지 남길 수 있어요."
+    if "\n" in clean_message or "\r" in clean_message:
+        clean_message = " ".join(clean_message.splitlines()).strip()
+    if contains_blocked_word(clean_message):
+        return False, "blocked_word", "남길 수 없는 표현이 포함되어 있어요."
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO gardener_guestbook_entries (
+                        owner_user_id,
+                        author_user_id,
+                        message,
+                        created_at
+                    ) VALUES (%s, %s, %s, NOW())
+                    """,
+                    (owner_user_id, user_id, clean_message),
+                )
+            conn.commit()
+        return True, "posted", "방명록을 남겼어요."
+    except Exception as exc:
+        print(f"[방명록 저장 오류] {type(exc).__name__}: {exc}")
+        return False, "guestbook_db_error", "방명록을 저장하지 못했어요."
+
+
+def delete_guestbook_entry(user_id: str, entry_id: int):
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT owner_user_id, author_user_id
+                    FROM gardener_guestbook_entries
+                    WHERE entry_id = %s
+                    """,
+                    (entry_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False, "entry_not_found", "이미 삭제되었거나 없는 글이에요."
+
+                owner_user_id = str(row[0])
+                author_user_id = str(row[1])
+                if user_id not in (owner_user_id, author_user_id):
+                    return False, "delete_not_allowed", "이 글을 삭제할 수 없어요."
+
+                cur.execute(
+                    "DELETE FROM gardener_guestbook_entries WHERE entry_id = %s",
+                    (entry_id,),
+                )
+            conn.commit()
+        return True, "deleted", "방명록 글을 삭제했어요."
+    except Exception as exc:
+        print(f"[방명록 삭제 오류] {type(exc).__name__}: {exc}")
+        return False, "guestbook_db_error", "방명록 글을 삭제하지 못했어요."
 
 
 def local_ipv4_candidates():
@@ -928,6 +1099,86 @@ async def handle_friend_response(ws, payload: dict):
             "accepted": accept and ok,
         },
     )
+
+
+async def handle_guestbook_load(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    owner_number = str(payload.get("garden_number", "")).strip()
+    data, error_code = load_guestbook(
+        str(state.get("account_user_id", "")),
+        owner_number,
+    )
+    if error_code:
+        message = (
+            "해당 정원사를 찾을 수 없어요."
+            if error_code == "owner_not_found"
+            else "방명록을 불러오지 못했어요. 잠시 후 다시 시도해주세요."
+        )
+        await send_json(ws, {
+            "type": "guestbook_load_result",
+            "ok": False,
+            "code": error_code,
+            "message": message,
+        })
+        return
+
+    await send_json(ws, {
+        "type": "guestbook_load_result",
+        "ok": True,
+        **data,
+    })
+
+
+async def handle_guestbook_post(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    owner_number = str(payload.get("garden_number", "")).strip()
+    message = str(payload.get("message", ""))
+    ok, code, result_message = post_guestbook_entry(
+        str(state.get("account_user_id", "")),
+        owner_number,
+        message,
+    )
+    await send_json(ws, {
+        "type": "guestbook_post_result",
+        "ok": ok,
+        "code": code,
+        "message": result_message,
+        "garden_number": owner_number,
+    })
+
+
+async def handle_guestbook_delete(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    try:
+        entry_id = int(payload.get("entry_id", 0))
+    except (TypeError, ValueError):
+        entry_id = 0
+    if entry_id <= 0:
+        await send_json(ws, {
+            "type": "guestbook_delete_result",
+            "ok": False,
+            "code": "invalid_entry_id",
+            "message": "삭제할 방명록 글을 확인할 수 없어요.",
+        })
+        return
+
+    ok, code, result_message = delete_guestbook_entry(
+        str(state.get("account_user_id", "")),
+        entry_id,
+    )
+    await send_json(ws, {
+        "type": "guestbook_delete_result",
+        "ok": ok,
+        "code": code,
+        "message": result_message,
+        "entry_id": entry_id,
+    })
 
 
 async def handle_chat_message(ws, payload: dict):
@@ -1515,6 +1766,15 @@ async def handle_client(ws):
             elif msg_type == "friend_response":
                 await handle_friend_response(ws, payload)
 
+            elif msg_type == "guestbook_load":
+                await handle_guestbook_load(ws, payload)
+
+            elif msg_type == "guestbook_post":
+                await handle_guestbook_post(ws, payload)
+
+            elif msg_type == "guestbook_delete":
+                await handle_guestbook_delete(ws, payload)
+
             elif msg_type == "message":
                 await handle_chat_message(ws, payload)
 
@@ -1558,7 +1818,7 @@ async def main():
     account_db_ready = ensure_account_db()
 
     print("=" * 60)
-    print(" FlowerGarden 정원사 광장 + 영구계정 + 친구 Render 서버 v5")
+    print(" FlowerGarden 정원사 광장 + 영구계정 + 친구 + 방명록 Render 서버 v6")
     print("=" * 60)
     print(f"Render 서버 포트: {PORT}")
     if account_db_ready:
