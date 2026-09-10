@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import socket
 import time
 from collections import deque
@@ -29,6 +30,9 @@ MAX_MESSAGE_LENGTH = 100
 # 정원번호/닉네임/레벨이 서버 재시작·재배포 후에도 유지됩니다.
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 ACCOUNT_LOOKUP_COOLDOWN_SECONDS = 1.0
+TRANSFER_CODE_LENGTH = 8
+TRANSFER_BACKUP_RETENTION_DAYS = 45
+TRANSFER_SAVE_MAX_BYTES = 1500 * 1024
 
 # 신고 정책
 REPORT_WINDOW_SECONDS = 10 * 60
@@ -211,6 +215,26 @@ def ensure_account_db() -> bool:
                         claimed_at,
                         created_at DESC
                     )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_transfer_backups (
+                        transfer_code CHAR(8) PRIMARY KEY,
+                        owner_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        garden_number CHAR(6) NOT NULL,
+                        save_data JSONB NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        expires_at TIMESTAMPTZ NOT NULL,
+                        used_at TIMESTAMPTZ NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_transfer_backups_owner_created
+                    ON gardener_transfer_backups (owner_user_id, created_at DESC)
                     """
                 )
             conn.commit()
@@ -1046,6 +1070,184 @@ def claim_flower_gift(receiver_user_id: str, gift_id: int):
         return False, "gift_db_error", "선물을 받지 못했어요. 잠시 후 다시 시도해주세요.", "", ""
 
 
+def is_valid_transfer_code(value: str) -> bool:
+    value = str(value).strip()
+    return len(value) == TRANSFER_CODE_LENGTH and value.isdigit()
+
+
+def create_transfer_backup(
+    owner_user_id: str,
+    garden_number: str,
+    save_data,
+):
+    owner_user_id = str(owner_user_id).strip()
+    garden_number = str(garden_number).strip()
+
+    if not owner_user_id or not is_valid_garden_number(garden_number):
+        return False, "invalid_account", "정원사 정보를 확인할 수 없어요.", ""
+
+    if not isinstance(save_data, dict):
+        return False, "invalid_save_data", "게임 저장정보를 확인할 수 없어요.", ""
+
+    saved_user_id = str(save_data.get("gardener_plaza_user_id", "")).strip()
+    saved_garden_number = str(
+        save_data.get("gardener_account_garden_number", "")
+    ).strip()
+    if saved_user_id != owner_user_id or saved_garden_number != garden_number:
+        return False, "save_owner_mismatch", "현재 정원사와 저장정보가 일치하지 않아요.", ""
+
+    try:
+        save_json = json.dumps(save_data, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return False, "invalid_save_data", "게임 저장정보를 읽지 못했어요.", ""
+
+    if len(save_json.encode("utf-8")) > TRANSFER_SAVE_MAX_BYTES:
+        return False, "save_too_large", "게임 저장정보가 너무 커서 이전코드를 만들지 못했어요.", ""
+
+    if not DATABASE_URL:
+        return False, "account_db_unavailable", "데이터 이전 서버가 연결되지 않았어요.", ""
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM gardener_transfer_backups
+                    WHERE expires_at <= NOW()
+                       OR used_at IS NOT NULL
+                    """
+                )
+
+                transfer_code = ""
+                for _ in range(20):
+                    candidate = str(
+                        secrets.randbelow(10 ** TRANSFER_CODE_LENGTH)
+                    ).zfill(TRANSFER_CODE_LENGTH)
+                    cur.execute(
+                        """
+                        SELECT 1
+                        FROM gardener_transfer_backups
+                        WHERE transfer_code = %s
+                        """,
+                        (candidate,),
+                    )
+                    if cur.fetchone() is None:
+                        transfer_code = candidate
+                        break
+
+                if not transfer_code:
+                    return False, "code_generation_failed", "이전코드를 만들지 못했어요. 다시 시도해주세요.", ""
+
+                cur.execute(
+                    """
+                    INSERT INTO gardener_transfer_backups (
+                        transfer_code,
+                        owner_user_id,
+                        garden_number,
+                        save_data,
+                        created_at,
+                        expires_at,
+                        used_at
+                    )
+                    VALUES (
+                        %s,
+                        %s,
+                        %s,
+                        %s::jsonb,
+                        NOW(),
+                        NOW() + (%s * INTERVAL '1 day'),
+                        NULL
+                    )
+                    """,
+                    (
+                        transfer_code,
+                        owner_user_id,
+                        garden_number,
+                        save_json,
+                        TRANSFER_BACKUP_RETENTION_DAYS,
+                    ),
+                )
+            conn.commit()
+
+        return True, "ok", "정식판 이전코드가 만들어졌어요.", transfer_code
+    except Exception as exc:
+        print(f"[데이터 이전 백업 오류] {type(exc).__name__}: {exc}")
+        return False, "transfer_db_error", "이전코드를 만들지 못했어요. 잠시 후 다시 시도해주세요.", ""
+
+
+def load_transfer_backup(transfer_code: str):
+    transfer_code = str(transfer_code).strip()
+    if not is_valid_transfer_code(transfer_code):
+        return None, "invalid_transfer_code"
+    if not DATABASE_URL:
+        return None, "account_db_unavailable"
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT b.owner_user_id,
+                           b.garden_number,
+                           b.save_data,
+                           a.nickname
+                    FROM gardener_transfer_backups b
+                    JOIN gardener_accounts a
+                      ON a.user_id = b.owner_user_id
+                    WHERE b.transfer_code = %s
+                      AND b.used_at IS NULL
+                      AND b.expires_at > NOW()
+                    """,
+                    (transfer_code,),
+                )
+                row = cur.fetchone()
+
+        if not row:
+            return None, "transfer_not_found"
+
+        save_data = row[2]
+        if isinstance(save_data, str):
+            save_data = json.loads(save_data)
+        if not isinstance(save_data, dict):
+            return None, "invalid_save_data"
+
+        return {
+            "owner_user_id": str(row[0]),
+            "garden_number": str(row[1]).strip(),
+            "save_data": save_data,
+            "nickname": str(row[3]),
+        }, ""
+    except Exception as exc:
+        print(f"[데이터 이전 불러오기 오류] {type(exc).__name__}: {exc}")
+        return None, "transfer_db_error"
+
+
+def complete_transfer_backup(transfer_code: str):
+    transfer_code = str(transfer_code).strip()
+    if not is_valid_transfer_code(transfer_code):
+        return False
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE gardener_transfer_backups
+                    SET used_at = NOW()
+                    WHERE transfer_code = %s
+                      AND used_at IS NULL
+                      AND expires_at > NOW()
+                    """,
+                    (transfer_code,),
+                )
+                changed = cur.rowcount > 0
+            conn.commit()
+        return changed
+    except Exception as exc:
+        print(f"[데이터 이전 완료처리 오류] {type(exc).__name__}: {exc}")
+        return False
+
+
 def format_guestbook_time(value) -> str:
     try:
         dt = value.astimezone(KST)
@@ -1773,6 +1975,100 @@ async def handle_garden_steal(ws, payload: dict):
 
 
 
+async def handle_transfer_backup(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    ok, code, message, transfer_code = create_transfer_backup(
+        str(state.get("account_user_id", "")),
+        str(state.get("garden_number", "")),
+        payload.get("save_data"),
+    )
+    await send_json(ws, {
+        "type": "transfer_backup_result",
+        "ok": ok,
+        "code": code,
+        "message": message,
+        "transfer_code": transfer_code,
+        "expires_days": TRANSFER_BACKUP_RETENTION_DAYS if ok else 0,
+    })
+
+
+async def handle_transfer_restore(ws, payload: dict):
+    state = clients[ws]
+    now = time.monotonic()
+    last_attempt = float(state.get("last_transfer_restore_attempt", 0.0))
+    if now - last_attempt < 1.0:
+        await send_json(ws, {
+            "type": "transfer_restore_result",
+            "ok": False,
+            "code": "too_fast",
+            "message": "잠시 후 다시 시도해주세요.",
+        })
+        return
+    state["last_transfer_restore_attempt"] = now
+
+    transfer_code = str(payload.get("transfer_code", "")).strip()
+    data, error_code = load_transfer_backup(transfer_code)
+    if error_code:
+        message = (
+            "이전코드 8자리를 확인해주세요."
+            if error_code == "invalid_transfer_code"
+            else "사용할 수 없거나 만료된 이전코드예요."
+            if error_code == "transfer_not_found"
+            else "이전 데이터를 불러오지 못했어요. 잠시 후 다시 시도해주세요."
+        )
+        await send_json(ws, {
+            "type": "transfer_restore_result",
+            "ok": False,
+            "code": error_code,
+            "message": message,
+        })
+        return
+
+    state["loaded_transfer_code"] = transfer_code
+    await send_json(ws, {
+        "type": "transfer_restore_result",
+        "ok": True,
+        "code": "ok",
+        "message": "베타판 데이터를 불러왔어요.",
+        "transfer_code": transfer_code,
+        "garden_number": data["garden_number"],
+        "nickname": data["nickname"],
+        "save_data": data["save_data"],
+    })
+
+
+async def handle_transfer_complete(ws, payload: dict):
+    state = clients[ws]
+    transfer_code = str(payload.get("transfer_code", "")).strip()
+    loaded_code = str(state.get("loaded_transfer_code", "")).strip()
+
+    if not transfer_code or transfer_code != loaded_code:
+        await send_json(ws, {
+            "type": "transfer_complete_result",
+            "ok": False,
+            "code": "transfer_not_loaded",
+            "message": "먼저 이전 데이터를 불러와주세요.",
+        })
+        return
+
+    ok = complete_transfer_backup(transfer_code)
+    if ok:
+        state["loaded_transfer_code"] = ""
+    await send_json(ws, {
+        "type": "transfer_complete_result",
+        "ok": ok,
+        "code": "ok" if ok else "transfer_complete_failed",
+        "message": (
+            "데이터 이전이 완료됐어요."
+            if ok
+            else "이전 완료처리를 하지 못했어요. 다시 시도해주세요."
+        ),
+    })
+
+
 async def handle_gift_send(ws, payload: dict):
     if not await require_registered_account(ws):
         return
@@ -2398,6 +2694,8 @@ async def handle_client(ws):
         "account_registered": False,
         "account_user_id": "",
         "last_account_lookup": 0.0,
+        "last_transfer_restore_attempt": 0.0,
+        "loaded_transfer_code": "",
     }
 
     try:
@@ -2463,6 +2761,15 @@ async def handle_client(ws):
 
             elif msg_type == "garden_steal":
                 await handle_garden_steal(ws, payload)
+
+            elif msg_type == "transfer_backup":
+                await handle_transfer_backup(ws, payload)
+
+            elif msg_type == "transfer_restore":
+                await handle_transfer_restore(ws, payload)
+
+            elif msg_type == "transfer_complete":
+                await handle_transfer_complete(ws, payload)
 
             elif msg_type == "gift_send":
                 await handle_gift_send(ws, payload)
@@ -2552,7 +2859,7 @@ async def main():
         PORT,
         ping_interval=20,
         ping_timeout=20,
-        max_size=8 * 1024,
+        max_size=2 * 1024 * 1024,
     ):
         console_task = asyncio.create_task(
             admin_console_loop()
