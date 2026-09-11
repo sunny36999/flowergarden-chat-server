@@ -1019,7 +1019,40 @@ def load_flower_gift_inbox(receiver_user_id: str):
     except Exception as exc:
         print(f"[받은 꽃 선물 불러오기 오류] {type(exc).__name__}: {exc}")
         return [], "gift_db_error"
-
+def load_flower_gift_history(receiver_user_id: str):
+    gifts = []
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT g.gift_id,
+                           g.flower_id,
+                           a.nickname,
+                           a.garden_number,
+                           g.claimed_at
+                    FROM gardener_flower_gifts g
+                    JOIN gardener_accounts a
+                      ON a.user_id = g.sender_user_id
+                    WHERE g.receiver_user_id = %s
+                      AND g.claimed_at IS NOT NULL
+                    ORDER BY g.claimed_at DESC, g.gift_id DESC
+                    LIMIT 100
+                    """,
+                    (receiver_user_id,),
+                )
+                for row in cur.fetchall():
+                    gifts.append({
+                        "gift_id": int(row[0]),
+                        "flower_id": str(row[1]),
+                        "sender_nickname": str(row[2]),
+                        "sender_garden_number": str(row[3]).strip(),
+                        "time_text": format_guestbook_time(row[4]),
+                    })
+        return gifts, ""
+    except Exception as exc:
+        print(f"[받은 꽃 선물 기록 불러오기 오류] {type(exc).__name__}: {exc}")
+        return [], "gift_db_error"
 
 def claim_flower_gift(receiver_user_id: str, gift_id: int):
     try:
@@ -2120,7 +2153,33 @@ async def handle_gift_inbox(ws, _payload: dict):
         "gifts": gifts,
     })
 
+async def handle_gift_history(ws, _payload: dict):
+    if not await require_registered_account(ws):
+        return
 
+    state = clients[ws]
+    gifts, error_code = load_flower_gift_history(
+        str(state.get("account_user_id", ""))
+    )
+
+    if error_code:
+        await send_json(ws, {
+            "type": "gift_history_result",
+            "ok": False,
+            "code": error_code,
+            "message": "받은 기록을 불러오지 못했어요. 잠시 후 다시 시도해주세요.",
+            "gifts": [],
+        })
+        return
+
+    await send_json(ws, {
+        "type": "gift_history_result",
+        "ok": True,
+        "code": "ok",
+        "message": "",
+        "gifts": gifts,
+    })
+    
 async def handle_gift_claim(ws, payload: dict):
     if not await require_registered_account(ws):
         return
@@ -2776,6 +2835,9 @@ async def handle_client(ws):
 
             elif msg_type == "gift_inbox":
                 await handle_gift_inbox(ws, payload)
+
+            elif msg_type == "gift_history":
+                await handle_gift_history(ws, payload)
 
             elif msg_type == "gift_claim":
                 await handle_gift_claim(ws, payload)
