@@ -507,8 +507,9 @@ def create_friend_request(user_id: str, target_garden_number: str):
 def get_friend_lists(user_id: str):
     friends = []
     incoming = []
+    outgoing = []
     if not DATABASE_URL:
-        return friends, incoming, "account_db_unavailable"
+        return friends, incoming, outgoing, "account_db_unavailable"
 
     try:
         with get_account_db_connection() as conn:
@@ -551,10 +552,29 @@ def get_friend_lists(user_id: str):
                         "garden_number": str(row[1]).strip(),
                         "level": int(row[2]),
                     })
-        return friends, incoming, ""
+
+                # 내가 보냈고 아직 상대가 수락/거절하지 않은 친구 요청입니다.
+                cur.execute(
+                    """
+                    SELECT a.nickname, a.garden_number, a.level
+                    FROM gardener_friend_requests r
+                    JOIN gardener_accounts a
+                      ON a.user_id = r.target_user_id
+                    WHERE r.requester_user_id = %s
+                    ORDER BY r.created_at DESC
+                    """,
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    outgoing.append({
+                        "nickname": str(row[0]),
+                        "garden_number": str(row[1]).strip(),
+                        "level": int(row[2]),
+                    })
+        return friends, incoming, outgoing, ""
     except Exception as exc:
         print(f"[친구 목록 오류] {type(exc).__name__}: {exc}")
-        return [], [], "friend_db_error"
+        return [], [], [], "friend_db_error"
 
 
 def get_friend_recommendations(user_id: str, limit: int = 8):
@@ -1855,7 +1875,7 @@ async def handle_friend_list(ws, _payload: dict):
     if not await require_registered_account(ws):
         return
     state = clients[ws]
-    friends, incoming, error_code = get_friend_lists(
+    friends, incoming, outgoing, error_code = get_friend_lists(
         str(state.get("account_user_id", ""))
     )
     if error_code:
@@ -1874,6 +1894,7 @@ async def handle_friend_list(ws, _payload: dict):
             "type": "friend_list_result",
             "friends": friends,
             "incoming_requests": incoming,
+            "outgoing_requests": outgoing,
         },
     )
 
