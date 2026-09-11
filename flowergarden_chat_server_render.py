@@ -557,6 +557,55 @@ def get_friend_lists(user_id: str):
         return [], [], "friend_db_error"
 
 
+def get_friend_recommendations(user_id: str, limit: int = 8):
+    if not DATABASE_URL:
+        return [], "account_db_unavailable"
+
+    try:
+        limit = max(1, min(20, int(limit)))
+    except (TypeError, ValueError):
+        limit = 8
+
+    try:
+        recommendations = []
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT a.nickname,
+                           a.garden_number,
+                           a.level
+                    FROM gardener_accounts a
+                    WHERE a.user_id <> %s
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM gardener_friendships f
+                          WHERE (f.user_id_a = %s AND f.user_id_b = a.user_id)
+                             OR (f.user_id_b = %s AND f.user_id_a = a.user_id)
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM gardener_friend_requests r
+                          WHERE (r.requester_user_id = %s AND r.target_user_id = a.user_id)
+                             OR (r.requester_user_id = a.user_id AND r.target_user_id = %s)
+                      )
+                    ORDER BY RANDOM()
+                    LIMIT %s
+                    """,
+                    (user_id, user_id, user_id, user_id, user_id, limit),
+                )
+                for row in cur.fetchall():
+                    recommendations.append({
+                        "nickname": str(row[0]),
+                        "garden_number": str(row[1]).strip(),
+                        "level": int(row[2]),
+                    })
+        return recommendations, ""
+    except Exception as exc:
+        print(f"[추천 정원사 오류] {type(exc).__name__}: {exc}")
+        return [], "friend_db_error"
+
+
 def respond_friend_request(user_id: str, requester_garden_number: str, accept: bool):
     requester, lookup_error = lookup_account_record(requester_garden_number)
     if lookup_error:
@@ -1019,6 +1068,8 @@ def load_flower_gift_inbox(receiver_user_id: str):
     except Exception as exc:
         print(f"[받은 꽃 선물 불러오기 오류] {type(exc).__name__}: {exc}")
         return [], "gift_db_error"
+
+
 def load_flower_gift_history(receiver_user_id: str):
     gifts = []
     try:
@@ -1053,6 +1104,7 @@ def load_flower_gift_history(receiver_user_id: str):
     except Exception as exc:
         print(f"[받은 꽃 선물 기록 불러오기 오류] {type(exc).__name__}: {exc}")
         return [], "gift_db_error"
+
 
 def claim_flower_gift(receiver_user_id: str, gift_id: int):
     try:
@@ -1826,6 +1878,40 @@ async def handle_friend_list(ws, _payload: dict):
     )
 
 
+async def handle_friend_recommendations(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    try:
+        limit = int(payload.get("limit", 8))
+    except (TypeError, ValueError):
+        limit = 8
+
+    recommendations, error_code = get_friend_recommendations(
+        str(state.get("account_user_id", "")),
+        limit,
+    )
+
+    if error_code:
+        await send_json(ws, {
+            "type": "friend_recommendations_result",
+            "ok": False,
+            "code": error_code,
+            "message": "추천 정원사를 불러오지 못했어요. 잠시 후 다시 시도해주세요.",
+            "recommendations": [],
+        })
+        return
+
+    await send_json(ws, {
+        "type": "friend_recommendations_result",
+        "ok": True,
+        "code": "ok",
+        "message": "",
+        "recommendations": recommendations,
+    })
+
+
 async def handle_friend_response(ws, payload: dict):
     if not await require_registered_account(ws):
         return
@@ -2153,6 +2239,7 @@ async def handle_gift_inbox(ws, _payload: dict):
         "gifts": gifts,
     })
 
+
 async def handle_gift_history(ws, _payload: dict):
     if not await require_registered_account(ws):
         return
@@ -2179,7 +2266,8 @@ async def handle_gift_history(ws, _payload: dict):
         "message": "",
         "gifts": gifts,
     })
-    
+
+
 async def handle_gift_claim(ws, payload: dict):
     if not await require_registered_account(ws):
         return
@@ -2799,6 +2887,9 @@ async def handle_client(ws):
 
             elif msg_type == "friend_list":
                 await handle_friend_list(ws, payload)
+
+            elif msg_type == "friend_recommendations":
+                await handle_friend_recommendations(ws, payload)
 
             elif msg_type == "friend_response":
                 await handle_friend_response(ws, payload)
