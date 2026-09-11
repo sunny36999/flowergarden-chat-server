@@ -1,0 +1,3052 @@
+# FlowerGarden Render server v8 - account/friends/guestbook/garden steal/flower gifts
+# FlowerGarden Render server v7 - 친구 꽃밭 보기/서리 + 기존 계정/친구/방명록/광장 유지
+import asyncio
+import json
+import os
+import re
+import secrets
+import socket
+import time
+from collections import deque
+from datetime import datetime, timedelta, timezone
+
+from websockets.asyncio.server import serve
+
+import psycopg
+from psycopg import errors as psycopg_errors
+
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", "8765"))
+
+MIN_CHAT_LEVEL = 5
+MAX_HISTORY = 50
+MAX_MESSAGE_LENGTH = 100
+
+# ==================================================
+# 🌱 계정 시스템 영구저장 - 외부 PostgreSQL
+# ==================================================
+# Render Free Web Service의 로컬 파일은 영구 저장용으로 사용하지 않습니다.
+# DATABASE_URL 환경변수에 Neon/Supabase 등 외부 PostgreSQL 연결주소를 넣으면
+# 정원번호/닉네임/레벨이 서버 재시작·재배포 후에도 유지됩니다.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+ACCOUNT_LOOKUP_COOLDOWN_SECONDS = 1.0
+TRANSFER_CODE_LENGTH = 8
+TRANSFER_BACKUP_RETENTION_DAYS = 45
+TRANSFER_SAVE_MAX_BYTES = 1500 * 1024
+
+# 신고 정책
+REPORT_WINDOW_SECONDS = 10 * 60
+REPORT_THRESHOLD = 3
+REPORT_AUTO_MUTE_SECONDS = 10 * 60
+
+# 기본 금칙어 필터
+BLOCKED_WORDS = [
+    "씨발",
+    "시발",
+    "ㅅㅂ",
+    "병신",
+    "개새끼",
+]
+
+KST = timezone(timedelta(hours=9))
+
+clients = {}                  # websocket -> state
+history = deque(maxlen=MAX_HISTORY)
+message_sequence = 0
+
+# user_id -> monotonic 만료시각
+muted_until_by_user = {}
+banned_until_by_user = {}
+
+# target_user_id -> {reporter_user_id: monotonic_report_time}
+report_votes = {}
+
+def now_kst_iso() -> str:
+    return datetime.now(KST).isoformat(timespec="seconds")
+
+
+def normalize_for_filter(text: str) -> str:
+    return "".join(text.lower().split())
+
+
+def contains_blocked_word(text: str) -> bool:
+    normalized = normalize_for_filter(text)
+    return any(word in normalized for word in BLOCKED_WORDS)
+
+
+def is_valid_garden_number(value: str) -> bool:
+    return len(value) == 6 and value.isdigit()
+
+
+def get_account_db_connection():
+    if not DATABASE_URL:
+        return None
+    return psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=10,
+    )
+
+
+def ensure_account_db() -> bool:
+    if not DATABASE_URL:
+        print("[계정 DB] DATABASE_URL 환경변수가 아직 없습니다.")
+        return False
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_accounts (
+                        user_id VARCHAR(80) PRIMARY KEY,
+                        garden_number CHAR(6) UNIQUE NOT NULL,
+                        nickname VARCHAR(12) NOT NULL,
+                        level INTEGER NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_friend_requests (
+                        requester_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        target_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (requester_user_id, target_user_id),
+                        CHECK (requester_user_id <> target_user_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_friendships (
+                        user_id_a VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        user_id_b VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (user_id_a, user_id_b),
+                        CHECK (user_id_a < user_id_b)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_guestbook_entries (
+                        entry_id BIGSERIAL PRIMARY KEY,
+                        owner_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        author_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        message VARCHAR(60) NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_guestbook_owner_created
+                    ON gardener_guestbook_entries (owner_user_id, created_at DESC)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_garden_snapshots (
+                        owner_user_id VARCHAR(80) PRIMARY KEY
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        plots JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_garden_steals (
+                        requester_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        owner_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        area_id VARCHAR(12) NOT NULL,
+                        bloom_id VARCHAR(140) NOT NULL,
+                        flower_id VARCHAR(100) NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (
+                            requester_user_id,
+                            owner_user_id,
+                            area_id,
+                            bloom_id
+                        ),
+                        CHECK (requester_user_id <> owner_user_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_garden_steals_owner_bloom
+                    ON gardener_garden_steals (
+                        owner_user_id,
+                        area_id,
+                        bloom_id
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_flower_gifts (
+                        gift_id BIGSERIAL PRIMARY KEY,
+                        sender_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        receiver_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        flower_id VARCHAR(100) NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        claimed_at TIMESTAMPTZ NULL,
+                        CHECK (sender_user_id <> receiver_user_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_flower_gifts_receiver_pending
+                    ON gardener_flower_gifts (
+                        receiver_user_id,
+                        claimed_at,
+                        created_at DESC
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_transfer_backups (
+                        transfer_code CHAR(8) PRIMARY KEY,
+                        owner_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        garden_number CHAR(6) NOT NULL,
+                        save_data JSONB NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        expires_at TIMESTAMPTZ NOT NULL,
+                        used_at TIMESTAMPTZ NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_transfer_backups_owner_created
+                    ON gardener_transfer_backups (owner_user_id, created_at DESC)
+                    """
+                )
+            conn.commit()
+        return True
+    except Exception as exc:
+        print(
+            "[계정 DB 준비 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return False
+
+
+def count_account_records() -> int:
+    if not DATABASE_URL:
+        return 0
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM gardener_accounts")
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def lookup_account_record(garden_number: str):
+    if not DATABASE_URL:
+        return None, "account_db_unavailable"
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT user_id, nickname, garden_number, level
+                    FROM gardener_accounts
+                    WHERE garden_number = %s
+                    """,
+                    (garden_number,),
+                )
+                row = cur.fetchone()
+
+        if not row:
+            return None, ""
+
+        return {
+            "user_id": str(row[0]),
+            "nickname": str(row[1]),
+            "garden_number": str(row[2]).strip(),
+            "level": int(row[3]),
+        }, ""
+
+    except Exception as exc:
+        print(
+            "[계정 DB 검색 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return None, "account_db_error"
+
+
+def register_account_record(
+    nickname: str,
+    user_id: str,
+    garden_number: str,
+    level: int,
+):
+    nickname = str(nickname).strip()
+    user_id = str(user_id).strip()
+    garden_number = str(garden_number).strip()
+
+    if not user_id or len(user_id) > 80:
+        return False, "invalid_user_id", "사용자 정보를 확인할 수 없어요."
+
+    if (
+        "\n" in nickname
+        or "\r" in nickname
+        or not (2 <= len(nickname) <= 12)
+    ):
+        return False, "invalid_nickname", "닉네임은 2~12글자로 입력해주세요."
+
+    if contains_blocked_word(nickname):
+        return False, "blocked_nickname", "사용할 수 없는 닉네임이에요."
+
+    if not is_valid_garden_number(garden_number):
+        return False, "invalid_garden_number", "정원번호 6자리를 확인해주세요."
+
+    if not DATABASE_URL:
+        return (
+            False,
+            "account_db_unavailable",
+            "계정 영구저장 서버가 아직 연결되지 않았어요.",
+        )
+
+    try:
+        level = max(0, int(level))
+    except (TypeError, ValueError):
+        level = 0
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT garden_number
+                    FROM gardener_accounts
+                    WHERE user_id = %s
+                    """,
+                    (user_id,),
+                )
+                own_row = cur.fetchone()
+
+                if own_row and str(own_row[0]).strip() != garden_number:
+                    return (
+                        False,
+                        "garden_number_locked",
+                        "이 정원사의 정원번호는 이미 다른 번호로 등록되어 있어요.",
+                    )
+
+                cur.execute(
+                    """
+                    SELECT user_id
+                    FROM gardener_accounts
+                    WHERE garden_number = %s
+                    """,
+                    (garden_number,),
+                )
+                number_row = cur.fetchone()
+
+                if number_row and str(number_row[0]).strip() != user_id:
+                    return (
+                        False,
+                        "garden_number_conflict",
+                        "이 정원번호가 다른 정원사와 겹쳤어요. 운영자에게 알려주세요.",
+                    )
+
+                if own_row:
+                    cur.execute(
+                        """
+                        UPDATE gardener_accounts
+                        SET nickname = %s,
+                            level = %s,
+                            updated_at = NOW()
+                        WHERE user_id = %s
+                        """,
+                        (nickname, level, user_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO gardener_accounts (
+                            user_id,
+                            nickname,
+                            garden_number,
+                            level,
+                            updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, NOW())
+                        """,
+                        (user_id, nickname, garden_number, level),
+                    )
+
+            conn.commit()
+
+        return True, "ok", "정원사 정보가 영구 저장되었어요."
+
+    except psycopg_errors.UniqueViolation:
+        return (
+            False,
+            "garden_number_conflict",
+            "이 정원번호가 다른 정원사와 겹쳤어요. 운영자에게 알려주세요.",
+        )
+    except Exception as exc:
+        print(
+            "[계정 DB 저장 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return (
+            False,
+            "account_db_error",
+            "계정 저장 서버에 잠시 문제가 있어요.",
+        )
+
+
+
+def get_friend_status(user_id: str, target_user_id: str) -> str:
+    if not user_id or not target_user_id:
+        return "none"
+    if user_id == target_user_id:
+        return "self"
+    if not DATABASE_URL:
+        return "none"
+
+    user_a, user_b = sorted([user_id, target_user_id])
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM gardener_friendships
+                    WHERE user_id_a = %s AND user_id_b = %s
+                    """,
+                    (user_a, user_b),
+                )
+                if cur.fetchone():
+                    return "friends"
+
+                cur.execute(
+                    """
+                    SELECT requester_user_id, target_user_id
+                    FROM gardener_friend_requests
+                    WHERE (requester_user_id = %s AND target_user_id = %s)
+                       OR (requester_user_id = %s AND target_user_id = %s)
+                    LIMIT 1
+                    """,
+                    (user_id, target_user_id, target_user_id, user_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return "none"
+                if str(row[0]) == user_id:
+                    return "outgoing"
+                return "incoming"
+    except Exception as exc:
+        print(f"[친구 상태 오류] {type(exc).__name__}: {exc}")
+        return "none"
+
+
+def create_friend_request(user_id: str, target_garden_number: str):
+    target, lookup_error = lookup_account_record(target_garden_number)
+    if lookup_error:
+        return False, "account_db_error", "계정 저장소에 잠시 문제가 있어요.", "none"
+    if not target:
+        return False, "target_not_found", "해당 정원사를 찾을 수 없어요.", "none"
+
+    target_user_id = str(target.get("user_id", ""))
+    if target_user_id == user_id:
+        return False, "self_request", "내 정원에는 친구 요청을 보낼 수 없어요.", "self"
+
+    status = get_friend_status(user_id, target_user_id)
+    if status == "friends":
+        return True, "already_friends", "이미 친구인 정원사예요.", "friends"
+    if status == "outgoing":
+        return True, "already_requested", "이미 친구 요청을 보냈어요.", "outgoing"
+    if status == "incoming":
+        return False, "incoming_request", "상대 정원사가 이미 친구 요청을 보냈어요. 받은 요청에서 확인해주세요.", "incoming"
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO gardener_friend_requests (
+                        requester_user_id,
+                        target_user_id,
+                        created_at
+                    ) VALUES (%s, %s, NOW())
+                    ON CONFLICT (requester_user_id, target_user_id) DO NOTHING
+                    """,
+                    (user_id, target_user_id),
+                )
+            conn.commit()
+        return True, "requested", "친구 요청을 보냈어요.", "outgoing"
+    except Exception as exc:
+        print(f"[친구 요청 저장 오류] {type(exc).__name__}: {exc}")
+        return False, "friend_db_error", "친구 요청을 저장하지 못했어요.", "none"
+
+
+def get_friend_lists(user_id: str):
+    friends = []
+    incoming = []
+    outgoing = []
+    if not DATABASE_URL:
+        return friends, incoming, outgoing, "account_db_unavailable"
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT a.nickname, a.garden_number, a.level
+                    FROM gardener_friendships f
+                    JOIN gardener_accounts a
+                      ON a.user_id = CASE
+                          WHEN f.user_id_a = %s THEN f.user_id_b
+                          ELSE f.user_id_a
+                      END
+                    WHERE f.user_id_a = %s OR f.user_id_b = %s
+                    ORDER BY LOWER(a.nickname), a.garden_number
+                    """,
+                    (user_id, user_id, user_id),
+                )
+                for row in cur.fetchall():
+                    friends.append({
+                        "nickname": str(row[0]),
+                        "garden_number": str(row[1]).strip(),
+                        "level": int(row[2]),
+                    })
+
+                cur.execute(
+                    """
+                    SELECT a.nickname, a.garden_number, a.level
+                    FROM gardener_friend_requests r
+                    JOIN gardener_accounts a
+                      ON a.user_id = r.requester_user_id
+                    WHERE r.target_user_id = %s
+                    ORDER BY r.created_at DESC
+                    """,
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    incoming.append({
+                        "nickname": str(row[0]),
+                        "garden_number": str(row[1]).strip(),
+                        "level": int(row[2]),
+                    })
+
+                # 내가 보냈고 아직 상대가 수락/거절하지 않은 친구 요청입니다.
+                cur.execute(
+                    """
+                    SELECT a.nickname, a.garden_number, a.level
+                    FROM gardener_friend_requests r
+                    JOIN gardener_accounts a
+                      ON a.user_id = r.target_user_id
+                    WHERE r.requester_user_id = %s
+                    ORDER BY r.created_at DESC
+                    """,
+                    (user_id,),
+                )
+                for row in cur.fetchall():
+                    outgoing.append({
+                        "nickname": str(row[0]),
+                        "garden_number": str(row[1]).strip(),
+                        "level": int(row[2]),
+                    })
+        return friends, incoming, outgoing, ""
+    except Exception as exc:
+        print(f"[친구 목록 오류] {type(exc).__name__}: {exc}")
+        return [], [], [], "friend_db_error"
+
+
+def get_friend_recommendations(user_id: str, limit: int = 8):
+    if not DATABASE_URL:
+        return [], "account_db_unavailable"
+
+    try:
+        limit = max(1, min(20, int(limit)))
+    except (TypeError, ValueError):
+        limit = 8
+
+    try:
+        recommendations = []
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT a.nickname,
+                           a.garden_number,
+                           a.level
+                    FROM gardener_accounts a
+                    WHERE a.user_id <> %s
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM gardener_friendships f
+                          WHERE (f.user_id_a = %s AND f.user_id_b = a.user_id)
+                             OR (f.user_id_b = %s AND f.user_id_a = a.user_id)
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM gardener_friend_requests r
+                          WHERE (r.requester_user_id = %s AND r.target_user_id = a.user_id)
+                             OR (r.requester_user_id = a.user_id AND r.target_user_id = %s)
+                      )
+                    ORDER BY RANDOM()
+                    LIMIT %s
+                    """,
+                    (user_id, user_id, user_id, user_id, user_id, limit),
+                )
+                for row in cur.fetchall():
+                    recommendations.append({
+                        "nickname": str(row[0]),
+                        "garden_number": str(row[1]).strip(),
+                        "level": int(row[2]),
+                    })
+        return recommendations, ""
+    except Exception as exc:
+        print(f"[추천 정원사 오류] {type(exc).__name__}: {exc}")
+        return [], "friend_db_error"
+
+
+def respond_friend_request(user_id: str, requester_garden_number: str, accept: bool):
+    requester, lookup_error = lookup_account_record(requester_garden_number)
+    if lookup_error:
+        return False, "account_db_error", "계정 저장소에 잠시 문제가 있어요."
+    if not requester:
+        return False, "requester_not_found", "친구 요청을 보낸 정원사를 찾을 수 없어요."
+
+    requester_user_id = str(requester.get("user_id", ""))
+    if requester_user_id == user_id:
+        return False, "invalid_request", "잘못된 친구 요청이에요."
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM gardener_friend_requests
+                    WHERE requester_user_id = %s AND target_user_id = %s
+                    """,
+                    (requester_user_id, user_id),
+                )
+                if not cur.fetchone():
+                    return False, "request_not_found", "이미 처리되었거나 없는 친구 요청이에요."
+
+                cur.execute(
+                    """
+                    DELETE FROM gardener_friend_requests
+                    WHERE requester_user_id = %s AND target_user_id = %s
+                    """,
+                    (requester_user_id, user_id),
+                )
+
+                if accept:
+                    user_a, user_b = sorted([user_id, requester_user_id])
+                    cur.execute(
+                        """
+                        INSERT INTO gardener_friendships (
+                            user_id_a, user_id_b, created_at
+                        ) VALUES (%s, %s, NOW())
+                        ON CONFLICT (user_id_a, user_id_b) DO NOTHING
+                        """,
+                        (user_a, user_b),
+                    )
+                    # 양방향으로 남은 중복 요청이 있다면 정리합니다.
+                    cur.execute(
+                        """
+                        DELETE FROM gardener_friend_requests
+                        WHERE (requester_user_id = %s AND target_user_id = %s)
+                           OR (requester_user_id = %s AND target_user_id = %s)
+                        """,
+                        (user_id, requester_user_id, requester_user_id, user_id),
+                    )
+            conn.commit()
+
+        if accept:
+            return True, "accepted", "친구가 되었어요!"
+        return True, "declined", "친구 요청을 거절했어요."
+    except Exception as exc:
+        print(f"[친구 요청 처리 오류] {type(exc).__name__}: {exc}")
+        return False, "friend_db_error", "친구 요청을 처리하지 못했어요."
+
+
+# ==================================================
+# 📖 방명록 1차 - Neon 영구저장
+# 읽기는 모든 등록 정원사, 작성은 친구만 가능합니다.
+# 작성자는 자기 글을 삭제할 수 있고, 방명록 주인은 자기 방명록의 모든 글을 삭제할 수 있습니다.
+# ==================================================
+
+GARDEN_AREA_IDS = ("center", "right", "left")
+
+
+def sanitize_garden_plots(raw_plots):
+    if not isinstance(raw_plots, list):
+        return None
+
+    by_area = {}
+    for raw in raw_plots[:6]:
+        if not isinstance(raw, dict):
+            continue
+
+        area_id = str(raw.get("area_id", "")).strip()
+        if area_id not in GARDEN_AREA_IDS:
+            continue
+
+        unlocked = bool(raw.get("unlocked", False))
+        flower_id = str(raw.get("flower_id", "")).strip()[:100]
+        bloom_id = str(raw.get("bloom_id", "")).strip()[:140]
+
+        try:
+            stage = max(0, min(4, int(raw.get("stage", 0))))
+        except (TypeError, ValueError):
+            stage = 0
+
+        fully_grown = bool(raw.get("fully_grown", False)) or stage >= 4
+
+        if not unlocked:
+            flower_id = ""
+            bloom_id = ""
+            stage = 0
+            fully_grown = False
+        elif not flower_id or stage <= 0:
+            flower_id = ""
+            bloom_id = ""
+            stage = 0
+            fully_grown = False
+        elif not fully_grown:
+            bloom_id = ""
+            stage = max(1, min(3, stage))
+        else:
+            stage = 4
+            fully_grown = True
+
+        by_area[area_id] = {
+            "area_id": area_id,
+            "unlocked": unlocked,
+            "flower_id": flower_id,
+            "stage": stage,
+            "fully_grown": fully_grown,
+            "bloom_id": bloom_id,
+        }
+
+    result = []
+    for area_id in GARDEN_AREA_IDS:
+        if area_id in by_area:
+            result.append(by_area[area_id])
+        else:
+            result.append({
+                "area_id": area_id,
+                "unlocked": area_id == "center",
+                "flower_id": "",
+                "stage": 0,
+                "fully_grown": False,
+                "bloom_id": "",
+            })
+    return result
+
+
+def save_garden_snapshot(user_id: str, raw_plots):
+    if not DATABASE_URL:
+        return False, "account_db_unavailable", "꽃밭 저장소가 아직 연결되지 않았어요."
+
+    plots = sanitize_garden_plots(raw_plots)
+    if plots is None:
+        return False, "invalid_garden_snapshot", "꽃밭 정보를 확인할 수 없어요."
+
+    try:
+        plots_json = json.dumps(plots, ensure_ascii=False)
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO gardener_garden_snapshots (
+                        owner_user_id,
+                        plots,
+                        updated_at
+                    )
+                    VALUES (%s, %s::jsonb, NOW())
+                    ON CONFLICT (owner_user_id)
+                    DO UPDATE SET
+                        plots = EXCLUDED.plots,
+                        updated_at = NOW()
+                    """,
+                    (user_id, plots_json),
+                )
+            conn.commit()
+        return True, "ok", "꽃밭 정보가 저장되었어요."
+    except Exception as exc:
+        print(f"[꽃밭 저장 오류] {type(exc).__name__}: {exc}")
+        return False, "garden_db_error", "꽃밭 정보를 저장하지 못했어요."
+
+
+def load_garden_snapshot(requester_user_id: str, owner_garden_number: str):
+    owner_record, lookup_error = lookup_account_record(owner_garden_number)
+    if lookup_error:
+        return None, lookup_error
+    if not owner_record:
+        return None, "owner_not_found"
+
+    owner_user_id = str(owner_record.get("user_id", ""))
+    is_owner = requester_user_id == owner_user_id
+    if not is_owner and get_friend_status(requester_user_id, owner_user_id) != "friends":
+        return None, "friends_only"
+
+    try:
+        plots = []
+        has_snapshot = False
+        stolen_keys = set()
+
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT plots
+                    FROM gardener_garden_snapshots
+                    WHERE owner_user_id = %s
+                    """,
+                    (owner_user_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    has_snapshot = True
+                    raw_plots = row[0]
+                    if isinstance(raw_plots, str):
+                        raw_plots = json.loads(raw_plots)
+                    sanitized = sanitize_garden_plots(raw_plots)
+                    if sanitized is not None:
+                        plots = sanitized
+
+                if not is_owner:
+                    cur.execute(
+                        """
+                        SELECT area_id, bloom_id
+                        FROM gardener_garden_steals
+                        WHERE requester_user_id = %s
+                          AND owner_user_id = %s
+                        """,
+                        (requester_user_id, owner_user_id),
+                    )
+                    stolen_keys = {
+                        (str(r[0]), str(r[1]))
+                        for r in cur.fetchall()
+                    }
+
+        if not plots:
+            plots = sanitize_garden_plots([])
+
+        result_plots = []
+        for plot in plots:
+            item = dict(plot)
+            key = (
+                str(item.get("area_id", "")),
+                str(item.get("bloom_id", "")),
+            )
+            bloom_ready = (
+                bool(item.get("unlocked", False))
+                and bool(item.get("fully_grown", False))
+                and int(item.get("stage", 0)) >= 4
+                and bool(item.get("flower_id", ""))
+                and bool(item.get("bloom_id", ""))
+            )
+            already_stolen = (not is_owner) and key in stolen_keys
+            item["already_stolen"] = already_stolen
+            item["can_steal"] = (
+                not is_owner
+                and bloom_ready
+                and not already_stolen
+            )
+            result_plots.append(item)
+
+        return {
+            "owner_nickname": owner_record.get("nickname", "정원사"),
+            "owner_garden_number": owner_garden_number,
+            "owner_level": int(owner_record.get("level", 0)),
+            "is_owner": is_owner,
+            "has_snapshot": has_snapshot,
+            "plots": result_plots,
+        }, ""
+
+    except Exception as exc:
+        print(f"[꽃밭 불러오기 오류] {type(exc).__name__}: {exc}")
+        return None, "garden_db_error"
+
+
+def steal_garden_flower(
+    requester_user_id: str,
+    owner_garden_number: str,
+    area_id: str,
+    bloom_id: str,
+):
+    area_id = str(area_id).strip()
+    bloom_id = str(bloom_id).strip()
+
+    if area_id not in GARDEN_AREA_IDS or not bloom_id:
+        return False, "invalid_steal_target", "서리할 꽃을 확인할 수 없어요.", ""
+
+    owner_record, lookup_error = lookup_account_record(owner_garden_number)
+    if lookup_error:
+        return False, lookup_error, "꽃밭 저장소에 연결하지 못했어요.", ""
+    if not owner_record:
+        return False, "owner_not_found", "해당 정원사를 찾을 수 없어요.", ""
+
+    owner_user_id = str(owner_record.get("user_id", ""))
+    if requester_user_id == owner_user_id:
+        return False, "cannot_steal_self", "내 꽃밭에서는 서리할 수 없어요.", ""
+
+    if get_friend_status(requester_user_id, owner_user_id) != "friends":
+        return False, "friends_only", "친구의 꽃밭에서만 서리할 수 있어요.", ""
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT plots
+                    FROM gardener_garden_snapshots
+                    WHERE owner_user_id = %s
+                    FOR UPDATE
+                    """,
+                    (owner_user_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False, "garden_not_synced", "친구 꽃밭 정보가 아직 없어요.", ""
+
+                raw_plots = row[0]
+                if isinstance(raw_plots, str):
+                    raw_plots = json.loads(raw_plots)
+                plots = sanitize_garden_plots(raw_plots) or []
+
+                target = None
+                for plot in plots:
+                    if str(plot.get("area_id", "")) == area_id:
+                        target = plot
+                        break
+
+                if not target:
+                    return False, "plot_not_found", "해당 꽃밭을 찾을 수 없어요.", ""
+
+                if (
+                    not bool(target.get("unlocked", False))
+                    or not bool(target.get("fully_grown", False))
+                    or int(target.get("stage", 0)) < 4
+                    or not str(target.get("flower_id", ""))
+                ):
+                    return False, "not_bloomed", "지금은 서리할 만개 꽃이 없어요.", ""
+
+                current_bloom_id = str(target.get("bloom_id", ""))
+                if not current_bloom_id or current_bloom_id != bloom_id:
+                    return False, "bloom_changed", "꽃밭 상태가 바뀌었어요. 다시 확인해주세요.", ""
+
+                flower_id = str(target.get("flower_id", ""))
+
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO gardener_garden_steals (
+                            requester_user_id,
+                            owner_user_id,
+                            area_id,
+                            bloom_id,
+                            flower_id,
+                            created_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, NOW())
+                        """,
+                        (
+                            requester_user_id,
+                            owner_user_id,
+                            area_id,
+                            bloom_id,
+                            flower_id,
+                        ),
+                    )
+                except psycopg_errors.UniqueViolation:
+                    conn.rollback()
+                    return False, "already_stolen", "이 만개 꽃은 이미 서리했어요.", ""
+
+            conn.commit()
+
+        return True, "ok", "서리 성공! 창고에 꽃 1개가 추가돼요.", flower_id
+
+    except Exception as exc:
+        print(f"[꽃밭 서리 오류] {type(exc).__name__}: {exc}")
+        return False, "garden_db_error", "서리하지 못했어요. 잠시 후 다시 시도해주세요.", ""
+
+
+def is_valid_gift_flower_id(flower_id: str) -> bool:
+    flower_id = str(flower_id).strip()
+    if not flower_id or len(flower_id) > 100:
+        return False
+    return re.fullmatch(r"[A-Za-z0-9_-]+", flower_id) is not None
+
+
+def send_flower_gift(
+    sender_user_id: str,
+    receiver_garden_number: str,
+    flower_id: str,
+):
+    flower_id = str(flower_id).strip()
+    if not is_valid_gift_flower_id(flower_id):
+        return False, "invalid_flower", "선물할 꽃을 확인할 수 없어요.", 0, ""
+
+    receiver, lookup_error = lookup_account_record(receiver_garden_number)
+    if lookup_error:
+        return False, lookup_error, "계정 저장소에 연결하지 못했어요.", 0, ""
+    if not receiver:
+        return False, "receiver_not_found", "해당 정원사를 찾을 수 없어요.", 0, ""
+
+    receiver_user_id = str(receiver.get("user_id", ""))
+    if sender_user_id == receiver_user_id:
+        return False, "cannot_gift_self", "나에게는 꽃을 선물할 수 없어요.", 0, ""
+
+    if get_friend_status(sender_user_id, receiver_user_id) != "friends":
+        return False, "friends_only", "친구에게만 꽃을 선물할 수 있어요.", 0, ""
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO gardener_flower_gifts (
+                        sender_user_id,
+                        receiver_user_id,
+                        flower_id,
+                        created_at
+                    )
+                    VALUES (%s, %s, %s, NOW())
+                    RETURNING gift_id
+                    """,
+                    (sender_user_id, receiver_user_id, flower_id),
+                )
+                row = cur.fetchone()
+                gift_id = int(row[0]) if row else 0
+            conn.commit()
+
+        return (
+            True,
+            "ok",
+            "꽃 선물을 보냈어요.",
+            gift_id,
+            str(receiver.get("nickname", "정원사")),
+        )
+    except Exception as exc:
+        print(f"[꽃 선물 보내기 오류] {type(exc).__name__}: {exc}")
+        return False, "gift_db_error", "선물을 보내지 못했어요. 잠시 후 다시 시도해주세요.", 0, ""
+
+
+def load_flower_gift_inbox(receiver_user_id: str):
+    gifts = []
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT g.gift_id,
+                           g.flower_id,
+                           a.nickname,
+                           a.garden_number,
+                           g.created_at
+                    FROM gardener_flower_gifts g
+                    JOIN gardener_accounts a
+                      ON a.user_id = g.sender_user_id
+                    WHERE g.receiver_user_id = %s
+                      AND g.claimed_at IS NULL
+                    ORDER BY g.created_at DESC, g.gift_id DESC
+                    LIMIT 100
+                    """,
+                    (receiver_user_id,),
+                )
+                for row in cur.fetchall():
+                    gifts.append({
+                        "gift_id": int(row[0]),
+                        "flower_id": str(row[1]),
+                        "sender_nickname": str(row[2]),
+                        "sender_garden_number": str(row[3]).strip(),
+                        "time_text": format_guestbook_time(row[4]),
+                    })
+        return gifts, ""
+    except Exception as exc:
+        print(f"[받은 꽃 선물 불러오기 오류] {type(exc).__name__}: {exc}")
+        return [], "gift_db_error"
+
+
+def load_flower_gift_history(receiver_user_id: str):
+    gifts = []
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT g.gift_id,
+                           g.flower_id,
+                           a.nickname,
+                           a.garden_number,
+                           g.claimed_at
+                    FROM gardener_flower_gifts g
+                    JOIN gardener_accounts a
+                      ON a.user_id = g.sender_user_id
+                    WHERE g.receiver_user_id = %s
+                      AND g.claimed_at IS NOT NULL
+                    ORDER BY g.claimed_at DESC, g.gift_id DESC
+                    LIMIT 100
+                    """,
+                    (receiver_user_id,),
+                )
+                for row in cur.fetchall():
+                    gifts.append({
+                        "gift_id": int(row[0]),
+                        "flower_id": str(row[1]),
+                        "sender_nickname": str(row[2]),
+                        "sender_garden_number": str(row[3]).strip(),
+                        "time_text": format_guestbook_time(row[4]),
+                    })
+        return gifts, ""
+    except Exception as exc:
+        print(f"[받은 꽃 선물 기록 불러오기 오류] {type(exc).__name__}: {exc}")
+        return [], "gift_db_error"
+
+
+def claim_flower_gift(receiver_user_id: str, gift_id: int):
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT g.receiver_user_id,
+                           g.flower_id,
+                           g.claimed_at,
+                           a.nickname
+                    FROM gardener_flower_gifts g
+                    JOIN gardener_accounts a
+                      ON a.user_id = g.sender_user_id
+                    WHERE g.gift_id = %s
+                    FOR UPDATE
+                    """,
+                    (gift_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False, "gift_not_found", "해당 선물을 찾을 수 없어요.", "", ""
+
+                gift_receiver_user_id = str(row[0])
+                flower_id = str(row[1])
+                claimed_at = row[2]
+                sender_nickname = str(row[3])
+
+                if gift_receiver_user_id != receiver_user_id:
+                    return False, "not_receiver", "내 선물만 받을 수 있어요.", "", ""
+
+                if claimed_at is not None:
+                    return False, "already_claimed", "이미 받은 선물이에요.", "", ""
+
+                cur.execute(
+                    """
+                    UPDATE gardener_flower_gifts
+                    SET claimed_at = NOW()
+                    WHERE gift_id = %s
+                    """,
+                    (gift_id,),
+                )
+            conn.commit()
+
+        return True, "ok", "선물을 받았어요.", flower_id, sender_nickname
+    except Exception as exc:
+        print(f"[꽃 선물 받기 오류] {type(exc).__name__}: {exc}")
+        return False, "gift_db_error", "선물을 받지 못했어요. 잠시 후 다시 시도해주세요.", "", ""
+
+
+def is_valid_transfer_code(value: str) -> bool:
+    value = str(value).strip()
+    return len(value) == TRANSFER_CODE_LENGTH and value.isdigit()
+
+
+def create_transfer_backup(
+    owner_user_id: str,
+    garden_number: str,
+    save_data,
+):
+    owner_user_id = str(owner_user_id).strip()
+    garden_number = str(garden_number).strip()
+
+    if not owner_user_id or not is_valid_garden_number(garden_number):
+        return False, "invalid_account", "정원사 정보를 확인할 수 없어요.", ""
+
+    if not isinstance(save_data, dict):
+        return False, "invalid_save_data", "게임 저장정보를 확인할 수 없어요.", ""
+
+    saved_user_id = str(save_data.get("gardener_plaza_user_id", "")).strip()
+    saved_garden_number = str(
+        save_data.get("gardener_account_garden_number", "")
+    ).strip()
+    if saved_user_id != owner_user_id or saved_garden_number != garden_number:
+        return False, "save_owner_mismatch", "현재 정원사와 저장정보가 일치하지 않아요.", ""
+
+    try:
+        save_json = json.dumps(save_data, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return False, "invalid_save_data", "게임 저장정보를 읽지 못했어요.", ""
+
+    if len(save_json.encode("utf-8")) > TRANSFER_SAVE_MAX_BYTES:
+        return False, "save_too_large", "게임 저장정보가 너무 커서 이전코드를 만들지 못했어요.", ""
+
+    if not DATABASE_URL:
+        return False, "account_db_unavailable", "데이터 이전 서버가 연결되지 않았어요.", ""
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM gardener_transfer_backups
+                    WHERE expires_at <= NOW()
+                       OR used_at IS NOT NULL
+                    """
+                )
+
+                transfer_code = ""
+                for _ in range(20):
+                    candidate = str(
+                        secrets.randbelow(10 ** TRANSFER_CODE_LENGTH)
+                    ).zfill(TRANSFER_CODE_LENGTH)
+                    cur.execute(
+                        """
+                        SELECT 1
+                        FROM gardener_transfer_backups
+                        WHERE transfer_code = %s
+                        """,
+                        (candidate,),
+                    )
+                    if cur.fetchone() is None:
+                        transfer_code = candidate
+                        break
+
+                if not transfer_code:
+                    return False, "code_generation_failed", "이전코드를 만들지 못했어요. 다시 시도해주세요.", ""
+
+                cur.execute(
+                    """
+                    INSERT INTO gardener_transfer_backups (
+                        transfer_code,
+                        owner_user_id,
+                        garden_number,
+                        save_data,
+                        created_at,
+                        expires_at,
+                        used_at
+                    )
+                    VALUES (
+                        %s,
+                        %s,
+                        %s,
+                        %s::jsonb,
+                        NOW(),
+                        NOW() + (%s * INTERVAL '1 day'),
+                        NULL
+                    )
+                    """,
+                    (
+                        transfer_code,
+                        owner_user_id,
+                        garden_number,
+                        save_json,
+                        TRANSFER_BACKUP_RETENTION_DAYS,
+                    ),
+                )
+            conn.commit()
+
+        return True, "ok", "정식판 이전코드가 만들어졌어요.", transfer_code
+    except Exception as exc:
+        print(f"[데이터 이전 백업 오류] {type(exc).__name__}: {exc}")
+        return False, "transfer_db_error", "이전코드를 만들지 못했어요. 잠시 후 다시 시도해주세요.", ""
+
+
+def load_transfer_backup(transfer_code: str):
+    transfer_code = str(transfer_code).strip()
+    if not is_valid_transfer_code(transfer_code):
+        return None, "invalid_transfer_code"
+    if not DATABASE_URL:
+        return None, "account_db_unavailable"
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT b.owner_user_id,
+                           b.garden_number,
+                           b.save_data,
+                           a.nickname
+                    FROM gardener_transfer_backups b
+                    JOIN gardener_accounts a
+                      ON a.user_id = b.owner_user_id
+                    WHERE b.transfer_code = %s
+                      AND b.used_at IS NULL
+                      AND b.expires_at > NOW()
+                    """,
+                    (transfer_code,),
+                )
+                row = cur.fetchone()
+
+        if not row:
+            return None, "transfer_not_found"
+
+        save_data = row[2]
+        if isinstance(save_data, str):
+            save_data = json.loads(save_data)
+        if not isinstance(save_data, dict):
+            return None, "invalid_save_data"
+
+        return {
+            "owner_user_id": str(row[0]),
+            "garden_number": str(row[1]).strip(),
+            "save_data": save_data,
+            "nickname": str(row[3]),
+        }, ""
+    except Exception as exc:
+        print(f"[데이터 이전 불러오기 오류] {type(exc).__name__}: {exc}")
+        return None, "transfer_db_error"
+
+
+def complete_transfer_backup(transfer_code: str):
+    transfer_code = str(transfer_code).strip()
+    if not is_valid_transfer_code(transfer_code):
+        return False
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE gardener_transfer_backups
+                    SET used_at = NOW()
+                    WHERE transfer_code = %s
+                      AND used_at IS NULL
+                      AND expires_at > NOW()
+                    """,
+                    (transfer_code,),
+                )
+                changed = cur.rowcount > 0
+            conn.commit()
+        return changed
+    except Exception as exc:
+        print(f"[데이터 이전 완료처리 오류] {type(exc).__name__}: {exc}")
+        return False
+
+
+def format_guestbook_time(value) -> str:
+    try:
+        dt = value.astimezone(KST)
+        period = "오전" if dt.hour < 12 else "오후"
+        hour = dt.hour % 12
+        if hour == 0:
+            hour = 12
+        return f"{dt.month}월 {dt.day}일 {period} {hour}:{dt.minute:02d}"
+    except Exception:
+        return ""
+
+
+def load_guestbook(user_id: str, owner_garden_number: str):
+    owner, lookup_error = lookup_account_record(owner_garden_number)
+    if lookup_error:
+        return None, "account_db_error"
+    if not owner:
+        return None, "owner_not_found"
+
+    owner_user_id = str(owner.get("user_id", ""))
+    can_write = get_friend_status(user_id, owner_user_id) == "friends"
+    is_owner = user_id == owner_user_id
+    entries = []
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT g.entry_id,
+                           g.author_user_id,
+                           a.nickname,
+                           a.garden_number,
+                           g.message,
+                           g.created_at
+                    FROM gardener_guestbook_entries g
+                    JOIN gardener_accounts a
+                      ON a.user_id = g.author_user_id
+                    WHERE g.owner_user_id = %s
+                    ORDER BY g.created_at DESC, g.entry_id DESC
+                    LIMIT 50
+                    """,
+                    (owner_user_id,),
+                )
+                for row in cur.fetchall():
+                    author_user_id = str(row[1])
+                    entries.append({
+                        "entry_id": int(row[0]),
+                        "author_nickname": str(row[2]),
+                        "author_garden_number": str(row[3]).strip(),
+                        "message": str(row[4]),
+                        "time_text": format_guestbook_time(row[5]),
+                        "can_delete": (
+                            user_id == author_user_id
+                            or user_id == owner_user_id
+                        ),
+                    })
+    except Exception as exc:
+        print(f"[방명록 불러오기 오류] {type(exc).__name__}: {exc}")
+        return None, "guestbook_db_error"
+
+    return {
+        "owner_nickname": str(owner.get("nickname", "정원사")),
+        "owner_garden_number": owner_garden_number,
+        "can_write": can_write,
+        "is_owner": is_owner,
+        "entries": entries,
+    }, ""
+
+
+def post_guestbook_entry(user_id: str, owner_garden_number: str, message: str):
+    owner, lookup_error = lookup_account_record(owner_garden_number)
+    if lookup_error:
+        return False, "account_db_error", "계정 저장소에 잠시 문제가 있어요."
+    if not owner:
+        return False, "owner_not_found", "해당 정원사를 찾을 수 없어요."
+
+    owner_user_id = str(owner.get("user_id", ""))
+    if owner_user_id == user_id:
+        return False, "self_write", "내 방명록에는 직접 글을 남길 수 없어요."
+
+    if get_friend_status(user_id, owner_user_id) != "friends":
+        return False, "friends_only", "친구에게만 방명록을 남길 수 있어요."
+
+    clean_message = str(message).strip()
+    if not clean_message:
+        return False, "empty_message", "방명록 내용을 입력해주세요."
+    if len(clean_message) > 60:
+        return False, "message_too_long", "방명록은 60자까지 남길 수 있어요."
+    if "\n" in clean_message or "\r" in clean_message:
+        clean_message = " ".join(clean_message.splitlines()).strip()
+    if contains_blocked_word(clean_message):
+        return False, "blocked_word", "남길 수 없는 표현이 포함되어 있어요."
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO gardener_guestbook_entries (
+                        owner_user_id,
+                        author_user_id,
+                        message,
+                        created_at
+                    ) VALUES (%s, %s, %s, NOW())
+                    """,
+                    (owner_user_id, user_id, clean_message),
+                )
+            conn.commit()
+        return True, "posted", "방명록을 남겼어요."
+    except Exception as exc:
+        print(f"[방명록 저장 오류] {type(exc).__name__}: {exc}")
+        return False, "guestbook_db_error", "방명록을 저장하지 못했어요."
+
+
+def delete_guestbook_entry(user_id: str, entry_id: int):
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT owner_user_id, author_user_id
+                    FROM gardener_guestbook_entries
+                    WHERE entry_id = %s
+                    """,
+                    (entry_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False, "entry_not_found", "이미 삭제되었거나 없는 글이에요."
+
+                owner_user_id = str(row[0])
+                author_user_id = str(row[1])
+                if user_id not in (owner_user_id, author_user_id):
+                    return False, "delete_not_allowed", "이 글을 삭제할 수 없어요."
+
+                cur.execute(
+                    "DELETE FROM gardener_guestbook_entries WHERE entry_id = %s",
+                    (entry_id,),
+                )
+            conn.commit()
+        return True, "deleted", "방명록 글을 삭제했어요."
+    except Exception as exc:
+        print(f"[방명록 삭제 오류] {type(exc).__name__}: {exc}")
+        return False, "guestbook_db_error", "방명록 글을 삭제하지 못했어요."
+
+
+def local_ipv4_candidates():
+    found = set()
+
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127."):
+                found.add(ip)
+    except OSError:
+        pass
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        found.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+
+    return sorted(found)
+
+
+def remaining_seconds(table: dict, user_id: str) -> int:
+    until = table.get(user_id, 0.0)
+    now = time.monotonic()
+
+    if until <= now:
+        table.pop(user_id, None)
+        return 0
+
+    return max(1, int(until - now + 0.999))
+
+
+def format_remaining(seconds: int) -> str:
+    if seconds <= 0:
+        return "0분"
+
+    minutes = max(1, (seconds + 59) // 60)
+    return f"{minutes}분"
+
+
+async def send_json(ws, payload: dict):
+    await ws.send(json.dumps(payload, ensure_ascii=False))
+
+
+async def broadcast(payload: dict):
+    joined = [
+        ws
+        for ws, state in list(clients.items())
+        if state.get("joined")
+    ]
+
+    if not joined:
+        return
+
+    text = json.dumps(payload, ensure_ascii=False)
+
+    await asyncio.gather(
+        *(ws.send(text) for ws in joined),
+        return_exceptions=True,
+    )
+
+
+async def broadcast_presence():
+    count = sum(
+        1
+        for state in clients.values()
+        if state.get("joined")
+    )
+
+    await broadcast({
+        "type": "presence",
+        "count": count,
+    })
+
+
+def validate_join(payload: dict):
+    nickname = str(payload.get("nickname", "")).strip()
+    user_id = str(payload.get("user_id", "")).strip()
+    garden_number = str(payload.get("garden_number", "")).strip()
+
+    try:
+        level = int(payload.get("level", 0))
+    except (TypeError, ValueError):
+        level = 0
+
+    if level < MIN_CHAT_LEVEL:
+        return (
+            False,
+            "level_required",
+            f"정원사 광장은 Lv.{MIN_CHAT_LEVEL}부터 이용할 수 있어요.",
+        )
+
+    if not user_id or len(user_id) > 80:
+        return (
+            False,
+            "invalid_user_id",
+            "사용자 정보를 확인할 수 없어요.",
+        )
+
+    if (
+        "\n" in nickname
+        or "\r" in nickname
+        or not (2 <= len(nickname) <= 12)
+    ):
+        return (
+            False,
+            "invalid_nickname",
+            "닉네임은 2~12글자로 입력해주세요.",
+        )
+
+    if contains_blocked_word(nickname):
+        return (
+            False,
+            "blocked_nickname",
+            "사용할 수 없는 닉네임이에요.",
+        )
+
+    banned_remaining = remaining_seconds(
+        banned_until_by_user,
+        user_id,
+    )
+
+    if banned_remaining > 0:
+        return (
+            False,
+            "temporarily_banned",
+            "광장 이용이 "
+            + format_remaining(banned_remaining)
+            + " 동안 제한되어 있어요.",
+        )
+
+    return (
+        True,
+        {
+            "nickname": nickname,
+            "user_id": user_id,
+            "level": level,
+            "garden_number": garden_number,
+        },
+        "",
+    )
+
+
+async def handle_join(ws, payload: dict):
+    state = clients[ws]
+
+    if state.get("joined"):
+        await send_json(
+            ws,
+            {
+                "type": "error",
+                "code": "already_joined",
+                "message": "이미 광장에 입장했어요.",
+            },
+        )
+        return
+
+    ok, data, message = validate_join(payload)
+
+    if not ok:
+        await send_json(
+            ws,
+            {
+                "type": "join_denied",
+                "code": data,
+                "message": message,
+            },
+        )
+        return
+
+    state.update(data)
+    state["joined"] = True
+
+    if is_valid_garden_number(state.get("garden_number", "")):
+        account_ok, account_code, account_message = register_account_record(
+            state["nickname"],
+            state["user_id"],
+            state["garden_number"],
+            state["level"],
+        )
+        if not account_ok:
+            print(
+                "[광장 계정등록 경고] "
+                f"{account_code}: {account_message}"
+            )
+
+    mute_remaining = remaining_seconds(
+        muted_until_by_user,
+        state["user_id"],
+    )
+
+    await send_json(
+        ws,
+        {
+            "type": "joined",
+            "nickname": state["nickname"],
+            "user_id": state["user_id"],
+            "level": state["level"],
+            "history": list(history),
+            "mute_remaining_seconds": mute_remaining,
+            "server_time": now_kst_iso(),
+        },
+    )
+
+    await broadcast_presence()
+
+    print(
+        f"[입장] {state['nickname']} / "
+        f"Lv.{state['level']} / {state['user_id']}"
+    )
+
+
+async def handle_account_register(ws, payload: dict):
+    nickname = str(payload.get("nickname", "")).strip()
+    user_id = str(payload.get("user_id", "")).strip()
+    garden_number = str(payload.get("garden_number", "")).strip()
+
+    try:
+        level = int(payload.get("level", 0))
+    except (TypeError, ValueError):
+        level = 0
+
+    ok, code, message = register_account_record(
+        nickname,
+        user_id,
+        garden_number,
+        level,
+    )
+
+    await send_json(
+        ws,
+        {
+            "type": "account_register_result",
+            "ok": ok,
+            "code": code,
+            "message": message,
+            "garden_number": garden_number,
+        },
+    )
+
+    if ok:
+        state = clients[ws]
+        state["account_registered"] = True
+        state["account_user_id"] = user_id
+        state["garden_number"] = garden_number
+        state["nickname"] = nickname
+        state["level"] = level
+        print(
+            f"[계정등록] {nickname} / "
+            f"정원번호 {garden_number} / {user_id}"
+        )
+
+
+async def handle_account_lookup(ws, payload: dict):
+    state = clients[ws]
+    now = time.monotonic()
+    last_lookup = float(state.get("last_account_lookup", 0.0))
+
+    if now - last_lookup < ACCOUNT_LOOKUP_COOLDOWN_SECONDS:
+        await send_json(
+            ws,
+            {
+                "type": "error",
+                "code": "lookup_too_fast",
+                "message": "정원사 찾기는 잠시 후 다시 이용해주세요.",
+            },
+        )
+        return
+
+    state["last_account_lookup"] = now
+    garden_number = str(payload.get("garden_number", "")).strip()
+
+    if not is_valid_garden_number(garden_number):
+        await send_json(
+            ws,
+            {
+                "type": "account_lookup_result",
+                "found": False,
+                "code": "invalid_garden_number",
+                "message": "정원번호 6자리를 확인해주세요.",
+            },
+        )
+        return
+
+    record, lookup_error = lookup_account_record(garden_number)
+
+    if lookup_error:
+        await send_json(
+            ws,
+            {
+                "type": "error",
+                "code": lookup_error,
+                "message": (
+                    "정원사 계정 저장소에 연결하지 못했어요. "
+                    "잠시 후 다시 시도해주세요."
+                ),
+            },
+        )
+        return
+
+    if not record:
+        await send_json(
+            ws,
+            {
+                "type": "account_lookup_result",
+                "found": False,
+                "garden_number": garden_number,
+            },
+        )
+        return
+
+    requester_user_id = str(state.get("account_user_id", ""))
+    target_user_id = str(record.get("user_id", ""))
+    friend_status = (
+        get_friend_status(requester_user_id, target_user_id)
+        if requester_user_id
+        else "none"
+    )
+
+    await send_json(
+        ws,
+        {
+            "type": "account_lookup_result",
+            "found": True,
+            "nickname": record.get("nickname", "정원사"),
+            "garden_number": garden_number,
+            "level": int(record.get("level", 0)),
+            "friend_status": friend_status,
+        },
+    )
+
+
+async def require_registered_account(ws):
+    state = clients[ws]
+    if state.get("account_registered") and state.get("account_user_id"):
+        return True
+    await send_json(
+        ws,
+        {
+            "type": "error",
+            "code": "account_registration_required",
+            "message": "먼저 정원사 계정 정보를 서버에 등록해주세요.",
+        },
+    )
+    return False
+
+
+async def handle_friend_request(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    garden_number = str(payload.get("garden_number", "")).strip()
+    ok, code, message, status = create_friend_request(
+        str(state.get("account_user_id", "")),
+        garden_number,
+    )
+    await send_json(
+        ws,
+        {
+            "type": "friend_request_result",
+            "ok": ok,
+            "code": code,
+            "message": message,
+            "garden_number": garden_number,
+            "friend_status": status,
+        },
+    )
+
+
+async def handle_friend_list(ws, _payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    friends, incoming, outgoing, error_code = get_friend_lists(
+        str(state.get("account_user_id", ""))
+    )
+    if error_code:
+        await send_json(
+            ws,
+            {
+                "type": "error",
+                "code": error_code,
+                "message": "친구 목록을 불러오지 못했어요. 잠시 후 다시 시도해주세요.",
+            },
+        )
+        return
+    await send_json(
+        ws,
+        {
+            "type": "friend_list_result",
+            "friends": friends,
+            "incoming_requests": incoming,
+            "outgoing_requests": outgoing,
+        },
+    )
+
+
+async def handle_friend_recommendations(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    try:
+        limit = int(payload.get("limit", 8))
+    except (TypeError, ValueError):
+        limit = 8
+
+    recommendations, error_code = get_friend_recommendations(
+        str(state.get("account_user_id", "")),
+        limit,
+    )
+
+    if error_code:
+        await send_json(ws, {
+            "type": "friend_recommendations_result",
+            "ok": False,
+            "code": error_code,
+            "message": "추천 정원사를 불러오지 못했어요. 잠시 후 다시 시도해주세요.",
+            "recommendations": [],
+        })
+        return
+
+    await send_json(ws, {
+        "type": "friend_recommendations_result",
+        "ok": True,
+        "code": "ok",
+        "message": "",
+        "recommendations": recommendations,
+    })
+
+
+async def handle_friend_response(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    requester_number = str(payload.get("garden_number", "")).strip()
+    accept = bool(payload.get("accept", False))
+    ok, code, message = respond_friend_request(
+        str(state.get("account_user_id", "")),
+        requester_number,
+        accept,
+    )
+    await send_json(
+        ws,
+        {
+            "type": "friend_response_result",
+            "ok": ok,
+            "code": code,
+            "message": message,
+            "garden_number": requester_number,
+            "accepted": accept and ok,
+        },
+    )
+
+
+async def handle_guestbook_load(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    owner_number = str(payload.get("garden_number", "")).strip()
+    data, error_code = load_guestbook(
+        str(state.get("account_user_id", "")),
+        owner_number,
+    )
+    if error_code:
+        message = (
+            "해당 정원사를 찾을 수 없어요."
+            if error_code == "owner_not_found"
+            else "방명록을 불러오지 못했어요. 잠시 후 다시 시도해주세요."
+        )
+        await send_json(ws, {
+            "type": "guestbook_load_result",
+            "ok": False,
+            "code": error_code,
+            "message": message,
+        })
+        return
+
+    await send_json(ws, {
+        "type": "guestbook_load_result",
+        "ok": True,
+        **data,
+    })
+
+
+async def handle_guestbook_post(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    owner_number = str(payload.get("garden_number", "")).strip()
+    message = str(payload.get("message", ""))
+    ok, code, result_message = post_guestbook_entry(
+        str(state.get("account_user_id", "")),
+        owner_number,
+        message,
+    )
+    await send_json(ws, {
+        "type": "guestbook_post_result",
+        "ok": ok,
+        "code": code,
+        "message": result_message,
+        "garden_number": owner_number,
+    })
+
+
+async def handle_guestbook_delete(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    try:
+        entry_id = int(payload.get("entry_id", 0))
+    except (TypeError, ValueError):
+        entry_id = 0
+    if entry_id <= 0:
+        await send_json(ws, {
+            "type": "guestbook_delete_result",
+            "ok": False,
+            "code": "invalid_entry_id",
+            "message": "삭제할 방명록 글을 확인할 수 없어요.",
+        })
+        return
+
+    ok, code, result_message = delete_guestbook_entry(
+        str(state.get("account_user_id", "")),
+        entry_id,
+    )
+    await send_json(ws, {
+        "type": "guestbook_delete_result",
+        "ok": ok,
+        "code": code,
+        "message": result_message,
+        "entry_id": entry_id,
+    })
+
+
+async def handle_garden_sync(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    ok, code, message = save_garden_snapshot(
+        str(state.get("account_user_id", "")),
+        payload.get("plots", []),
+    )
+    await send_json(ws, {
+        "type": "garden_sync_result",
+        "ok": ok,
+        "code": code,
+        "message": message,
+    })
+
+
+async def handle_garden_load(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    owner_number = str(payload.get("garden_number", "")).strip()
+    data, error_code = load_garden_snapshot(
+        str(state.get("account_user_id", "")),
+        owner_number,
+    )
+
+    if error_code:
+        if error_code == "friends_only":
+            message = "친구의 꽃밭만 볼 수 있어요."
+        elif error_code == "owner_not_found":
+            message = "해당 정원사를 찾을 수 없어요."
+        else:
+            message = "친구 꽃밭을 불러오지 못했어요. 잠시 후 다시 시도해주세요."
+        await send_json(ws, {
+            "type": "garden_load_result",
+            "ok": False,
+            "code": error_code,
+            "message": message,
+        })
+        return
+
+    await send_json(ws, {
+        "type": "garden_load_result",
+        "ok": True,
+        **data,
+    })
+
+
+async def handle_garden_steal(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    owner_number = str(payload.get("garden_number", "")).strip()
+    area_id = str(payload.get("area_id", "")).strip()
+    bloom_id = str(payload.get("bloom_id", "")).strip()
+
+    ok, code, message, flower_id = steal_garden_flower(
+        str(state.get("account_user_id", "")),
+        owner_number,
+        area_id,
+        bloom_id,
+    )
+    await send_json(ws, {
+        "type": "garden_steal_result",
+        "ok": ok,
+        "code": code,
+        "message": message,
+        "garden_number": owner_number,
+        "area_id": area_id,
+        "bloom_id": bloom_id,
+        "flower_id": flower_id,
+    })
+
+
+
+async def handle_transfer_backup(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    ok, code, message, transfer_code = create_transfer_backup(
+        str(state.get("account_user_id", "")),
+        str(state.get("garden_number", "")),
+        payload.get("save_data"),
+    )
+    await send_json(ws, {
+        "type": "transfer_backup_result",
+        "ok": ok,
+        "code": code,
+        "message": message,
+        "transfer_code": transfer_code,
+        "expires_days": TRANSFER_BACKUP_RETENTION_DAYS if ok else 0,
+    })
+
+
+async def handle_transfer_restore(ws, payload: dict):
+    state = clients[ws]
+    now = time.monotonic()
+    last_attempt = float(state.get("last_transfer_restore_attempt", 0.0))
+    if now - last_attempt < 1.0:
+        await send_json(ws, {
+            "type": "transfer_restore_result",
+            "ok": False,
+            "code": "too_fast",
+            "message": "잠시 후 다시 시도해주세요.",
+        })
+        return
+    state["last_transfer_restore_attempt"] = now
+
+    transfer_code = str(payload.get("transfer_code", "")).strip()
+    data, error_code = load_transfer_backup(transfer_code)
+    if error_code:
+        message = (
+            "이전코드 8자리를 확인해주세요."
+            if error_code == "invalid_transfer_code"
+            else "사용할 수 없거나 만료된 이전코드예요."
+            if error_code == "transfer_not_found"
+            else "이전 데이터를 불러오지 못했어요. 잠시 후 다시 시도해주세요."
+        )
+        await send_json(ws, {
+            "type": "transfer_restore_result",
+            "ok": False,
+            "code": error_code,
+            "message": message,
+        })
+        return
+
+    state["loaded_transfer_code"] = transfer_code
+    await send_json(ws, {
+        "type": "transfer_restore_result",
+        "ok": True,
+        "code": "ok",
+        "message": "베타판 데이터를 불러왔어요.",
+        "transfer_code": transfer_code,
+        "garden_number": data["garden_number"],
+        "nickname": data["nickname"],
+        "save_data": data["save_data"],
+    })
+
+
+async def handle_transfer_complete(ws, payload: dict):
+    state = clients[ws]
+    transfer_code = str(payload.get("transfer_code", "")).strip()
+    loaded_code = str(state.get("loaded_transfer_code", "")).strip()
+
+    if not transfer_code or transfer_code != loaded_code:
+        await send_json(ws, {
+            "type": "transfer_complete_result",
+            "ok": False,
+            "code": "transfer_not_loaded",
+            "message": "먼저 이전 데이터를 불러와주세요.",
+        })
+        return
+
+    ok = complete_transfer_backup(transfer_code)
+    if ok:
+        state["loaded_transfer_code"] = ""
+    await send_json(ws, {
+        "type": "transfer_complete_result",
+        "ok": ok,
+        "code": "ok" if ok else "transfer_complete_failed",
+        "message": (
+            "데이터 이전이 완료됐어요."
+            if ok
+            else "이전 완료처리를 하지 못했어요. 다시 시도해주세요."
+        ),
+    })
+
+
+async def handle_gift_send(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    receiver_number = str(payload.get("garden_number", "")).strip()
+    flower_id = str(payload.get("flower_id", "")).strip()
+
+    ok, code, message, gift_id, receiver_nickname = send_flower_gift(
+        str(state.get("account_user_id", "")),
+        receiver_number,
+        flower_id,
+    )
+    await send_json(ws, {
+        "type": "gift_send_result",
+        "ok": ok,
+        "code": code,
+        "message": message,
+        "gift_id": gift_id,
+        "garden_number": receiver_number,
+        "receiver_nickname": receiver_nickname,
+        "flower_id": flower_id,
+    })
+
+
+async def handle_gift_inbox(ws, _payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    gifts, error_code = load_flower_gift_inbox(
+        str(state.get("account_user_id", ""))
+    )
+    if error_code:
+        await send_json(ws, {
+            "type": "gift_inbox_result",
+            "ok": False,
+            "code": error_code,
+            "message": "받은 선물을 불러오지 못했어요. 잠시 후 다시 시도해주세요.",
+            "gifts": [],
+        })
+        return
+
+    await send_json(ws, {
+        "type": "gift_inbox_result",
+        "ok": True,
+        "code": "ok",
+        "message": "",
+        "gifts": gifts,
+    })
+
+
+async def handle_gift_history(ws, _payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    gifts, error_code = load_flower_gift_history(
+        str(state.get("account_user_id", ""))
+    )
+
+    if error_code:
+        await send_json(ws, {
+            "type": "gift_history_result",
+            "ok": False,
+            "code": error_code,
+            "message": "받은 기록을 불러오지 못했어요. 잠시 후 다시 시도해주세요.",
+            "gifts": [],
+        })
+        return
+
+    await send_json(ws, {
+        "type": "gift_history_result",
+        "ok": True,
+        "code": "ok",
+        "message": "",
+        "gifts": gifts,
+    })
+
+
+async def handle_gift_claim(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    try:
+        gift_id = int(payload.get("gift_id", 0))
+    except (TypeError, ValueError):
+        gift_id = 0
+
+    if gift_id <= 0:
+        await send_json(ws, {
+            "type": "gift_claim_result",
+            "ok": False,
+            "code": "invalid_gift_id",
+            "message": "받을 선물을 확인할 수 없어요.",
+            "gift_id": gift_id,
+            "flower_id": "",
+        })
+        return
+
+    ok, code, message, flower_id, sender_nickname = claim_flower_gift(
+        str(state.get("account_user_id", "")),
+        gift_id,
+    )
+    await send_json(ws, {
+        "type": "gift_claim_result",
+        "ok": ok,
+        "code": code,
+        "message": message,
+        "gift_id": gift_id,
+        "flower_id": flower_id,
+        "sender_nickname": sender_nickname,
+    })
+
+
+async def handle_chat_message(ws, payload: dict):
+    global message_sequence
+
+    state = clients[ws]
+
+    if not state.get("joined"):
+        await send_json(
+            ws,
+            {
+                "type": "error",
+                "code": "not_joined",
+                "message": "먼저 광장에 입장해주세요.",
+            },
+        )
+        return
+
+    if state.get("level", 0) < MIN_CHAT_LEVEL:
+        await send_json(
+            ws,
+            {
+                "type": "error",
+                "code": "level_required",
+                "message": f"Lv.{MIN_CHAT_LEVEL}부터 채팅할 수 있어요.",
+            },
+        )
+        return
+
+    mute_remaining = remaining_seconds(
+        muted_until_by_user,
+        state["user_id"],
+    )
+
+    if mute_remaining > 0:
+        await send_json(
+            ws,
+            {
+                "type": "moderation",
+                "action": "mute",
+                "remaining_seconds": mute_remaining,
+                "message": (
+                    "광장 채팅이 "
+                    + format_remaining(mute_remaining)
+                    + " 동안 제한되어 있어요."
+                ),
+            },
+        )
+        return
+
+    message = str(payload.get("message", "")).strip()
+
+    if not message:
+        return
+
+    if len(message) > MAX_MESSAGE_LENGTH:
+        await send_json(
+            ws,
+            {
+                "type": "error",
+                "code": "message_too_long",
+                "message": (
+                    f"메시지는 {MAX_MESSAGE_LENGTH}자까지 "
+                    "입력할 수 있어요."
+                ),
+            },
+        )
+        return
+
+    if contains_blocked_word(message):
+        await send_json(
+            ws,
+            {
+                "type": "error",
+                "code": "blocked_word",
+                "message": "보낼 수 없는 표현이 포함되어 있어요.",
+            },
+        )
+        return
+
+    # 일반 사용자에게는 전송 쿨타임을 두지 않습니다.
+    message_sequence += 1
+
+    outgoing = {
+        "type": "message",
+        "message_id": message_sequence,
+        "user_id": state["user_id"],
+        "nickname": state["nickname"],
+        "message": message,
+        "time": now_kst_iso(),
+    }
+
+    history.append(outgoing)
+
+    await broadcast(outgoing)
+
+    print(
+        f"[{state['nickname']}] "
+        f"#{message_sequence} {message}"
+    )
+
+
+def find_history_message(message_id: int):
+    for item in reversed(history):
+        if int(item.get("message_id", -1)) == message_id:
+            return item
+    return None
+
+
+def prune_report_votes(target_user_id: str):
+    votes = report_votes.get(target_user_id)
+
+    if not votes:
+        return {}
+
+    now = time.monotonic()
+
+    stale = [
+        reporter_id
+        for reporter_id, report_time in votes.items()
+        if now - report_time > REPORT_WINDOW_SECONDS
+    ]
+
+    for reporter_id in stale:
+        votes.pop(reporter_id, None)
+
+    if not votes:
+        report_votes.pop(target_user_id, None)
+        return {}
+
+    return votes
+
+
+async def notify_user_id(user_id: str, payload: dict):
+    for ws, state in list(clients.items()):
+        if (
+            state.get("joined")
+            and state.get("user_id") == user_id
+        ):
+            try:
+                await send_json(ws, payload)
+            except Exception:
+                pass
+
+
+async def handle_report(ws, payload: dict):
+    state = clients[ws]
+
+    if not state.get("joined"):
+        await send_json(
+            ws,
+            {
+                "type": "error",
+                "code": "not_joined",
+                "message": "먼저 광장에 입장해주세요.",
+            },
+        )
+        return
+
+    try:
+        message_id = int(payload.get("message_id", -1))
+    except (TypeError, ValueError):
+        message_id = -1
+
+    target_user_id = str(
+        payload.get("target_user_id", "")
+    ).strip()
+
+    message_item = find_history_message(message_id)
+
+    if (
+        message_item is None
+        or not target_user_id
+        or message_item.get("user_id") != target_user_id
+    ):
+        await send_json(
+            ws,
+            {
+                "type": "report_result",
+                "ok": False,
+                "message": "신고할 메시지를 확인할 수 없어요.",
+            },
+        )
+        return
+
+    if target_user_id == state["user_id"]:
+        await send_json(
+            ws,
+            {
+                "type": "report_result",
+                "ok": False,
+                "message": "내 메시지는 신고할 수 없어요.",
+            },
+        )
+        return
+
+    votes = prune_report_votes(target_user_id)
+
+    if state["user_id"] in votes:
+        await send_json(
+            ws,
+            {
+                "type": "report_result",
+                "ok": False,
+                "message": (
+                    "같은 정원사는 일정 시간 동안 "
+                    "한 번만 신고할 수 있어요."
+                ),
+            },
+        )
+        return
+
+    votes = report_votes.setdefault(target_user_id, {})
+    votes[state["user_id"]] = time.monotonic()
+
+    count = len(votes)
+
+    print(
+        f"[신고] {state['nickname']} -> "
+        f"{message_item.get('nickname', target_user_id)} "
+        f"(현재 {count}/{REPORT_THRESHOLD})"
+    )
+
+    await send_json(
+        ws,
+        {
+            "type": "report_result",
+            "ok": True,
+            "count": count,
+            "threshold": REPORT_THRESHOLD,
+            "message": "신고가 접수되었습니다.",
+        },
+    )
+
+    if count < REPORT_THRESHOLD:
+        return
+
+    muted_until_by_user[target_user_id] = (
+        time.monotonic() + REPORT_AUTO_MUTE_SECONDS
+    )
+
+    report_votes.pop(target_user_id, None)
+
+    await notify_user_id(
+        target_user_id,
+        {
+            "type": "moderation",
+            "action": "mute",
+            "remaining_seconds": REPORT_AUTO_MUTE_SECONDS,
+            "message": (
+                "신고 누적으로 광장 채팅이 "
+                + format_remaining(REPORT_AUTO_MUTE_SECONDS)
+                + " 동안 제한되었습니다."
+            ),
+        },
+    )
+
+    print(
+        "[자동 채팅금지] "
+        f"{message_item.get('nickname', target_user_id)} "
+        f"/ {format_remaining(REPORT_AUTO_MUTE_SECONDS)}"
+    )
+
+
+def matching_clients(target: str):
+    exact_id = [
+        (ws, state)
+        for ws, state in clients.items()
+        if state.get("joined")
+        and state.get("user_id") == target
+    ]
+
+    if exact_id:
+        return exact_id
+
+    return [
+        (ws, state)
+        for ws, state in clients.items()
+        if state.get("joined")
+        and state.get("nickname") == target
+    ]
+
+
+async def operator_list():
+    joined = [
+        state
+        for state in clients.values()
+        if state.get("joined")
+    ]
+
+    if not joined:
+        print("[운영] 현재 접속자가 없습니다.")
+        return
+
+    print("[운영] 현재 접속자")
+
+    for state in joined:
+        mute_seconds = remaining_seconds(
+            muted_until_by_user,
+            state["user_id"],
+        )
+
+        mute_text = (
+            f" / 채팅금지 {format_remaining(mute_seconds)}"
+            if mute_seconds > 0
+            else ""
+        )
+
+        print(
+            " - "
+            f"{state['nickname']} / "
+            f"Lv.{state['level']} / "
+            f"{state['user_id']}"
+            f"{mute_text}"
+        )
+
+
+async def operator_mute(target: str, minutes: int):
+    matches = matching_clients(target)
+
+    if not matches:
+        print("[운영] 해당 접속자를 찾을 수 없습니다.")
+        return
+
+    if len(matches) > 1:
+        print(
+            "[운영] 같은 닉네임이 여러 명입니다. "
+            "/list에서 user_id를 확인해주세요."
+        )
+        return
+
+    _ws, state = matches[0]
+
+    seconds = max(1, minutes) * 60
+
+    muted_until_by_user[state["user_id"]] = (
+        time.monotonic() + seconds
+    )
+
+    await notify_user_id(
+        state["user_id"],
+        {
+            "type": "moderation",
+            "action": "mute",
+            "remaining_seconds": seconds,
+            "message": (
+                "운영자에 의해 광장 채팅이 "
+                + format_remaining(seconds)
+                + " 동안 제한되었습니다."
+            ),
+        },
+    )
+
+    print(
+        f"[운영 채팅금지] {state['nickname']} / "
+        f"{minutes}분"
+    )
+
+
+async def operator_unmute(target: str):
+    matches = matching_clients(target)
+
+    if not matches:
+        # 접속 중이 아니더라도 user_id를 직접 입력할 수 있게 함
+        if target in muted_until_by_user:
+            muted_until_by_user.pop(target, None)
+            print("[운영] 채팅금지를 해제했습니다.")
+            return
+
+        print("[운영] 해당 접속자를 찾을 수 없습니다.")
+        return
+
+    if len(matches) > 1:
+        print(
+            "[운영] 같은 닉네임이 여러 명입니다. "
+            "/list에서 user_id를 확인해주세요."
+        )
+        return
+
+    _ws, state = matches[0]
+
+    muted_until_by_user.pop(state["user_id"], None)
+
+    await notify_user_id(
+        state["user_id"],
+        {
+            "type": "moderation",
+            "action": "unmute",
+            "remaining_seconds": 0,
+            "message": "광장 채팅 제한이 해제되었습니다.",
+        },
+    )
+
+    print(f"[운영 채팅금지 해제] {state['nickname']}")
+
+
+async def operator_kick(
+    target: str,
+    ban_minutes: int,
+):
+    matches = matching_clients(target)
+
+    if not matches:
+        print("[운영] 해당 접속자를 찾을 수 없습니다.")
+        return
+
+    if len(matches) > 1:
+        print(
+            "[운영] 같은 닉네임이 여러 명입니다. "
+            "/list에서 user_id를 확인해주세요."
+        )
+        return
+
+    ws, state = matches[0]
+
+    seconds = max(1, ban_minutes) * 60
+
+    banned_until_by_user[state["user_id"]] = (
+        time.monotonic() + seconds
+    )
+
+    try:
+        await send_json(
+            ws,
+            {
+                "type": "moderation",
+                "action": "kick",
+                "remaining_seconds": seconds,
+                "message": (
+                    "운영자에 의해 광장에서 퇴장되었습니다. "
+                    + format_remaining(seconds)
+                    + " 동안 다시 입장할 수 없습니다."
+                ),
+            },
+        )
+    except Exception:
+        pass
+
+    try:
+        await ws.close(
+            code=4003,
+            reason="operator kick",
+        )
+    except Exception:
+        pass
+
+    print(
+        f"[운영 강퇴] {state['nickname']} / "
+        f"재입장 제한 {ban_minutes}분"
+    )
+
+
+def print_operator_help():
+    print("")
+    print("[운영자 명령어]")
+    print("  /list")
+    print("  /mute 닉네임 10")
+    print("  /unmute 닉네임")
+    print("  /kick 닉네임 30")
+    print("  /help")
+    print("")
+
+
+async def admin_console_loop():
+    print_operator_help()
+
+    while True:
+        try:
+            command = await asyncio.to_thread(input, "")
+        except (EOFError, KeyboardInterrupt):
+            return
+
+        command = command.strip()
+
+        if not command:
+            continue
+
+        parts = command.split()
+        action = parts[0].lower()
+
+        try:
+            if action == "/list":
+                await operator_list()
+
+            elif action == "/mute" and len(parts) >= 2:
+                minutes = (
+                    int(parts[2])
+                    if len(parts) >= 3
+                    else 10
+                )
+                await operator_mute(
+                    parts[1],
+                    max(1, minutes),
+                )
+
+            elif action == "/unmute" and len(parts) >= 2:
+                await operator_unmute(parts[1])
+
+            elif action == "/kick" and len(parts) >= 2:
+                minutes = (
+                    int(parts[2])
+                    if len(parts) >= 3
+                    else 30
+                )
+                await operator_kick(
+                    parts[1],
+                    max(1, minutes),
+                )
+
+            elif action == "/help":
+                print_operator_help()
+
+            else:
+                print(
+                    "[운영] 명령어를 확인해주세요. "
+                    "/help 를 입력하면 목록이 나옵니다."
+                )
+
+        except ValueError:
+            print(
+                "[운영] 시간은 숫자(분)로 입력해주세요."
+            )
+        except Exception as exc:
+            print(
+                "[운영 오류] "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+
+async def handle_client(ws):
+    clients[ws] = {
+        "joined": False,
+        "nickname": "",
+        "user_id": "",
+        "level": 0,
+        "garden_number": "",
+        "account_registered": False,
+        "account_user_id": "",
+        "last_account_lookup": 0.0,
+        "last_transfer_restore_attempt": 0.0,
+        "loaded_transfer_code": "",
+    }
+
+    try:
+        async for raw in ws:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                await send_json(
+                    ws,
+                    {
+                        "type": "error",
+                        "code": "bad_json",
+                        "message": "잘못된 요청이에요.",
+                    },
+                )
+                continue
+
+            if not isinstance(payload, dict):
+                await send_json(
+                    ws,
+                    {
+                        "type": "error",
+                        "code": "bad_request",
+                        "message": "잘못된 요청이에요.",
+                    },
+                )
+                continue
+
+            msg_type = payload.get("type")
+
+            if msg_type == "join":
+                await handle_join(ws, payload)
+
+            elif msg_type == "account_register":
+                await handle_account_register(ws, payload)
+
+            elif msg_type == "account_lookup":
+                await handle_account_lookup(ws, payload)
+
+            elif msg_type == "friend_request":
+                await handle_friend_request(ws, payload)
+
+            elif msg_type == "friend_list":
+                await handle_friend_list(ws, payload)
+
+            elif msg_type == "friend_recommendations":
+                await handle_friend_recommendations(ws, payload)
+
+            elif msg_type == "friend_response":
+                await handle_friend_response(ws, payload)
+
+            elif msg_type == "guestbook_load":
+                await handle_guestbook_load(ws, payload)
+
+            elif msg_type == "guestbook_post":
+                await handle_guestbook_post(ws, payload)
+
+            elif msg_type == "guestbook_delete":
+                await handle_guestbook_delete(ws, payload)
+
+            elif msg_type == "garden_sync":
+                await handle_garden_sync(ws, payload)
+
+            elif msg_type == "garden_load":
+                await handle_garden_load(ws, payload)
+
+            elif msg_type == "garden_steal":
+                await handle_garden_steal(ws, payload)
+
+            elif msg_type == "transfer_backup":
+                await handle_transfer_backup(ws, payload)
+
+            elif msg_type == "transfer_restore":
+                await handle_transfer_restore(ws, payload)
+
+            elif msg_type == "transfer_complete":
+                await handle_transfer_complete(ws, payload)
+
+            elif msg_type == "gift_send":
+                await handle_gift_send(ws, payload)
+
+            elif msg_type == "gift_inbox":
+                await handle_gift_inbox(ws, payload)
+
+            elif msg_type == "gift_history":
+                await handle_gift_history(ws, payload)
+
+            elif msg_type == "gift_claim":
+                await handle_gift_claim(ws, payload)
+
+            elif msg_type == "message":
+                await handle_chat_message(ws, payload)
+
+            elif msg_type == "report":
+                await handle_report(ws, payload)
+
+            elif msg_type == "ping":
+                await send_json(
+                    ws,
+                    {
+                        "type": "pong",
+                        "time": now_kst_iso(),
+                    },
+                )
+
+            else:
+                await send_json(
+                    ws,
+                    {
+                        "type": "error",
+                        "code": "unknown_type",
+                        "message": "알 수 없는 요청이에요.",
+                    },
+                )
+
+    except Exception as exc:
+        print(
+            f"[연결 종료] "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    finally:
+        state = clients.pop(ws, None)
+
+        if state and state.get("joined"):
+            print(f"[퇴장] {state['nickname']}")
+            await broadcast_presence()
+
+
+async def main():
+    account_db_ready = ensure_account_db()
+
+    print("=" * 60)
+    print(" FlowerGarden 정원사 광장 + 영구계정 + 친구 + 방명록 Render 서버 v6")
+    print("=" * 60)
+    print(f"Render 서버 포트: {PORT}")
+    if account_db_ready:
+        print(f"영구 계정 DB 연결: 정상 / 등록 {count_account_records()}명")
+    else:
+        print("영구 계정 DB 연결: 미설정 또는 연결 실패")
+
+    ips = local_ipv4_candidates()
+
+    if ips:
+        print("같은 Wi-Fi 휴대폰 주소 후보:")
+        for ip in ips:
+            print(f"  ws://{ip}:{PORT}")
+    else:
+        print(
+            "로컬 IP를 찾지 못했습니다. "
+            "ipconfig로 IPv4 주소를 확인해주세요."
+        )
+
+    print(f"채팅 가능 레벨: Lv.{MIN_CHAT_LEVEL} 이상")
+    print("일반 채팅 전송 쿨타임: 없음")
+    print(
+        "신고 자동제재: "
+        f"{REPORT_THRESHOLD}명 신고 -> "
+        f"{REPORT_AUTO_MUTE_SECONDS // 60}분 채팅금지"
+    )
+    print("서버 종료: Ctrl + C")
+    print("=" * 60)
+
+    async with serve(
+        handle_client,
+        HOST,
+        PORT,
+        ping_interval=20,
+        ping_timeout=20,
+        max_size=2 * 1024 * 1024,
+    ):
+        console_task = asyncio.create_task(
+            admin_console_loop()
+        )
+
+        try:
+            await asyncio.Future()
+        finally:
+            console_task.cancel()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n서버를 종료했습니다.")
