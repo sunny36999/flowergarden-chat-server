@@ -577,6 +577,57 @@ def get_friend_lists(user_id: str):
         return [], [], [], "friend_db_error"
 
 
+
+def remove_friend(user_id: str, target_garden_number: str):
+    target, lookup_error = lookup_account_record(target_garden_number)
+    if lookup_error:
+        return False, "account_db_error", "계정 저장소에 잠시 문제가 있어요."
+    if not target:
+        return False, "target_not_found", "친구 정보를 찾을 수 없어요."
+
+    target_user_id = str(target.get("user_id", ""))
+    if not target_user_id or target_user_id == user_id:
+        return False, "invalid_target", "삭제할 친구를 확인할 수 없어요."
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM gardener_friendships
+                    WHERE (user_id_a = %s AND user_id_b = %s)
+                       OR (user_id_a = %s AND user_id_b = %s)
+                    """,
+                    (user_id, target_user_id, target_user_id, user_id),
+                )
+                if not cur.fetchone():
+                    return False, "not_friends", "이미 친구목록에 없는 정원사예요."
+
+                cur.execute(
+                    """
+                    DELETE FROM gardener_friendships
+                    WHERE (user_id_a = %s AND user_id_b = %s)
+                       OR (user_id_a = %s AND user_id_b = %s)
+                    """,
+                    (user_id, target_user_id, target_user_id, user_id),
+                )
+
+                # 삭제 후 서로 다시 친구신청할 수 있도록 혹시 남아 있는 대기 요청도 정리합니다.
+                cur.execute(
+                    """
+                    DELETE FROM gardener_friend_requests
+                    WHERE (requester_user_id = %s AND target_user_id = %s)
+                       OR (requester_user_id = %s AND target_user_id = %s)
+                    """,
+                    (user_id, target_user_id, target_user_id, user_id),
+                )
+            conn.commit()
+        return True, "removed", "친구를 삭제했어요."
+    except Exception as exc:
+        print(f"[친구 삭제 오류] {type(exc).__name__}: {exc}")
+        return False, "friend_db_error", "친구를 삭제하지 못했어요. 잠시 후 다시 시도해주세요."
+
 def get_friend_recommendations(user_id: str, limit: int = 8):
     if not DATABASE_URL:
         return [], "account_db_unavailable"
@@ -1899,6 +1950,27 @@ async def handle_friend_list(ws, _payload: dict):
     )
 
 
+
+async def handle_friend_remove(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    garden_number = str(payload.get("garden_number", "")).strip()
+    ok, code, message = remove_friend(
+        str(state.get("account_user_id", "")),
+        garden_number,
+    )
+    await send_json(
+        ws,
+        {
+            "type": "friend_remove_result",
+            "ok": ok,
+            "code": code,
+            "message": message,
+            "garden_number": garden_number,
+        },
+    )
+
 async def handle_friend_recommendations(ws, payload: dict):
     if not await require_registered_account(ws):
         return
@@ -2908,6 +2980,9 @@ async def handle_client(ws):
 
             elif msg_type == "friend_list":
                 await handle_friend_list(ws, payload)
+
+            elif msg_type == "friend_remove":
+                await handle_friend_remove(ws, payload)
 
             elif msg_type == "friend_recommendations":
                 await handle_friend_recommendations(ws, payload)
