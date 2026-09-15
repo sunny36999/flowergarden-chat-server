@@ -1,3 +1,4 @@
+# FlowerGarden Render server - friend garden offline growth/steal fix 2026-09-16
 # FlowerGarden Render server - together garden server integration 2026-09-15
 # FlowerGarden Render server v8 - account/friends/guestbook/garden steal/flower gifts
 # FlowerGarden Render server v7 - 친구 꽃밭 보기/서리 + 기존 계정/친구/방명록/광장 유지
@@ -1166,12 +1167,24 @@ def sanitize_garden_plots(raw_plots):
 
         unlocked = bool(raw.get("unlocked", False))
         flower_id = str(raw.get("flower_id", "")).strip()[:100]
+        # 2026-09-16: bloom_id는 성장 중에도 유지합니다.
+        # 심어진 꽃 1회의 고유 ID이므로 주인이 오프라인인 사이 만개해도 같은 꽃으로 서리 판정합니다.
         bloom_id = str(raw.get("bloom_id", "")).strip()[:140]
 
         try:
             stage = max(0, min(4, int(raw.get("stage", 0))))
         except (TypeError, ValueError):
             stage = 0
+
+        try:
+            growth_finish_unix = max(0.0, float(raw.get("growth_finish_unix", 0.0)))
+        except (TypeError, ValueError):
+            growth_finish_unix = 0.0
+
+        try:
+            stage_duration_seconds = max(0.0, float(raw.get("stage_duration_seconds", 0.0)))
+        except (TypeError, ValueError):
+            stage_duration_seconds = 0.0
 
         fully_grown = bool(raw.get("fully_grown", False)) or stage >= 4
 
@@ -1180,13 +1193,16 @@ def sanitize_garden_plots(raw_plots):
             bloom_id = ""
             stage = 0
             fully_grown = False
+            growth_finish_unix = 0.0
+            stage_duration_seconds = 0.0
         elif not flower_id or stage <= 0:
             flower_id = ""
             bloom_id = ""
             stage = 0
             fully_grown = False
+            growth_finish_unix = 0.0
+            stage_duration_seconds = 0.0
         elif not fully_grown:
-            bloom_id = ""
             stage = max(1, min(3, stage))
         else:
             stage = 4
@@ -1199,6 +1215,8 @@ def sanitize_garden_plots(raw_plots):
             "stage": stage,
             "fully_grown": fully_grown,
             "bloom_id": bloom_id,
+            "growth_finish_unix": growth_finish_unix,
+            "stage_duration_seconds": stage_duration_seconds,
         }
 
     result = []
@@ -1213,8 +1231,51 @@ def sanitize_garden_plots(raw_plots):
                 "stage": 0,
                 "fully_grown": False,
                 "bloom_id": "",
+                "growth_finish_unix": 0.0,
+                "stage_duration_seconds": 0.0,
             })
     return result
+
+
+def resolve_garden_growth(raw_plots):
+    """
+    저장된 완료 Unix 시각을 기준으로 친구 꽃밭의 현재 성장단계를 서버에서 계산합니다.
+    주인이 게임을 꺼둔 상태여도 친구가 열어보는 순간 stage1~4/만개 여부가 최신 상태가 됩니다.
+    """
+    plots = sanitize_garden_plots(raw_plots) or []
+    now_unix = time.time()
+    resolved = []
+
+    for raw in plots:
+        item = dict(raw)
+        unlocked = bool(item.get("unlocked", False))
+        flower_id = str(item.get("flower_id", ""))
+        fully_grown = bool(item.get("fully_grown", False))
+        stage = int(item.get("stage", 0))
+        finish_unix = float(item.get("growth_finish_unix", 0.0) or 0.0)
+        stage_seconds = float(item.get("stage_duration_seconds", 0.0) or 0.0)
+
+        if unlocked and flower_id and stage > 0 and not fully_grown and finish_unix > 0.0:
+            remaining = finish_unix - now_unix
+            if remaining <= 0.0:
+                fully_grown = True
+                stage = 4
+            elif stage_seconds > 0.0:
+                if remaining > stage_seconds * 2.0:
+                    stage = 1
+                elif remaining > stage_seconds:
+                    stage = 2
+                else:
+                    stage = 3
+
+        if fully_grown:
+            stage = 4
+
+        item["stage"] = max(0, min(4, stage))
+        item["fully_grown"] = fully_grown
+        resolved.append(item)
+
+    return resolved
 
 
 def save_garden_snapshot(user_id: str, raw_plots):
@@ -1286,7 +1347,7 @@ def load_garden_snapshot(requester_user_id: str, owner_garden_number: str):
                         raw_plots = json.loads(raw_plots)
                     sanitized = sanitize_garden_plots(raw_plots)
                     if sanitized is not None:
-                        plots = sanitized
+                        plots = resolve_garden_growth(sanitized)
 
                 if not is_owner:
                     cur.execute(
@@ -1387,7 +1448,8 @@ def steal_garden_flower(
                 raw_plots = row[0]
                 if isinstance(raw_plots, str):
                     raw_plots = json.loads(raw_plots)
-                plots = sanitize_garden_plots(raw_plots) or []
+                # 주인이 오프라인이어도 완료시각이 지났다면 여기서 즉시 만개로 판정합니다.
+                plots = resolve_garden_growth(raw_plots)
 
                 target = None
                 for plot in plots:
