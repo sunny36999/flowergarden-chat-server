@@ -1,8 +1,13 @@
+# FlowerGarden Render server - legacy friend garden auto-migration for existing users 2026-09-16
+# - old snapshots without bloom/timing metadata are upgraded server-side
+# - offline growth/steal works without requiring every existing user to open a new APK first
+# - old-client resync preserves server-generated legacy bloom/timing metadata when possible
 # FlowerGarden Render server - friend garden offline growth/steal fix 2026-09-16
 # FlowerGarden Render server - together garden server integration 2026-09-15
 # FlowerGarden Render server v8 - account/friends/guestbook/garden steal/flower gifts
 # FlowerGarden Render server v7 - 친구 꽃밭 보기/서리 + 기존 계정/친구/방명록/광장 유지
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -1151,6 +1156,45 @@ def respond_friend_request(user_id: str, requester_garden_number: str, accept: b
 
 GARDEN_AREA_IDS = ("center", "right", "left")
 
+# 구버전 꽃밭 스냅샷에는 성장 완료시각/단계당 시간/bloom_id가 없을 수 있습니다.
+# 현재 게임 밸런스의 총 성장시간 상한(60분)을 기준으로 보수적으로 복원합니다.
+# 예: stage1 스냅샷은 마지막 서버 저장시각 + 최대 60분,
+#     stage2는 +40분, stage3는 +20분 후 만개로 처리합니다.
+LEGACY_GARDEN_MAX_TOTAL_GROWTH_SECONDS = 60.0 * 60.0
+LEGACY_GARDEN_STAGE_SECONDS = LEGACY_GARDEN_MAX_TOTAL_GROWTH_SECONDS / 3.0
+
+
+def _db_timestamp_to_unix(value, fallback: float | None = None) -> float:
+    if fallback is None:
+        fallback = time.time()
+    if value is None:
+        return float(fallback)
+    if isinstance(value, datetime):
+        try:
+            return float(value.timestamp())
+        except Exception:
+            return float(fallback)
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return float(fallback)
+
+
+def _make_legacy_bloom_id(
+    owner_user_id: str,
+    area_id: str,
+    flower_id: str,
+    snapshot_updated_at,
+) -> str:
+    """
+    구버전 스냅샷용 bloom_id를 결정적으로 생성합니다.
+    같은 DB 스냅샷을 여러 번 읽어도 같은 ID가 나오므로 서리 중복 판정이 안정적입니다.
+    """
+    base_unix = int(_db_timestamp_to_unix(snapshot_updated_at))
+    raw = f"{owner_user_id}|{area_id}|{flower_id}|{base_unix}".encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()[:28]
+    return f"legacy_{digest}"
+
 
 def sanitize_garden_plots(raw_plots):
     if not isinstance(raw_plots, list):
@@ -1167,7 +1211,7 @@ def sanitize_garden_plots(raw_plots):
 
         unlocked = bool(raw.get("unlocked", False))
         flower_id = str(raw.get("flower_id", "")).strip()[:100]
-        # 2026-09-16: bloom_id는 성장 중에도 유지합니다.
+        # bloom_id는 성장 중에도 유지합니다.
         # 심어진 꽃 1회의 고유 ID이므로 주인이 오프라인인 사이 만개해도 같은 꽃으로 서리 판정합니다.
         bloom_id = str(raw.get("bloom_id", "")).strip()[:140]
 
@@ -1237,6 +1281,72 @@ def sanitize_garden_plots(raw_plots):
     return result
 
 
+def upgrade_legacy_garden_plots(
+    raw_plots,
+    owner_user_id: str,
+    snapshot_updated_at,
+):
+    """
+    기존 사용자(구버전 APK)의 꽃밭 데이터를 서버에서 자동 보강합니다.
+
+    - bloom_id가 없으면 서버가 안정적인 legacy ID 생성
+    - 성장 완료시각이 없으면 마지막 스냅샷 저장시각 + 최대 잔여 성장시간으로 복원
+    - stage_duration_seconds가 없으면 현재 전체 성장 상한 기준으로 복원
+
+    이 함수 덕분에 기존 사용자가 새 APK를 한 번 실행하지 않아도,
+    오래된 꽃은 시간이 충분히 지났다면 친구 꽃밭에서 만개/서리 가능 상태가 됩니다.
+    """
+    plots = sanitize_garden_plots(raw_plots)
+    if plots is None:
+        return None
+
+    base_unix = _db_timestamp_to_unix(snapshot_updated_at)
+    upgraded = []
+
+    for raw in plots:
+        item = dict(raw)
+        if (
+            bool(item.get("unlocked", False))
+            and str(item.get("flower_id", ""))
+            and int(item.get("stage", 0)) > 0
+        ):
+            area_id = str(item.get("area_id", ""))
+            flower_id = str(item.get("flower_id", ""))
+            stage = max(1, min(4, int(item.get("stage", 1))))
+            fully_grown = bool(item.get("fully_grown", False)) or stage >= 4
+            finish_unix = float(item.get("growth_finish_unix", 0.0) or 0.0)
+            stage_seconds = float(item.get("stage_duration_seconds", 0.0) or 0.0)
+
+            if not str(item.get("bloom_id", "")):
+                item["bloom_id"] = _make_legacy_bloom_id(
+                    owner_user_id,
+                    area_id,
+                    flower_id,
+                    snapshot_updated_at,
+                )
+
+            if stage_seconds <= 0.0:
+                item["stage_duration_seconds"] = LEGACY_GARDEN_STAGE_SECONDS
+                stage_seconds = LEGACY_GARDEN_STAGE_SECONDS
+
+            if fully_grown:
+                item["stage"] = 4
+                item["fully_grown"] = True
+                if finish_unix <= 0.0:
+                    item["growth_finish_unix"] = base_unix
+            elif finish_unix <= 0.0:
+                # stage1→만개 최대 3단계, stage2→2단계, stage3→1단계가 남아 있습니다.
+                remaining_stages = max(1, 4 - stage)
+                item["growth_finish_unix"] = (
+                    base_unix
+                    + LEGACY_GARDEN_STAGE_SECONDS * float(remaining_stages)
+                )
+
+        upgraded.append(item)
+
+    return upgraded
+
+
 def resolve_garden_growth(raw_plots):
     """
     저장된 완료 Unix 시각을 기준으로 친구 꽃밭의 현재 성장단계를 서버에서 계산합니다.
@@ -1278,18 +1388,133 @@ def resolve_garden_growth(raw_plots):
     return resolved
 
 
+def _plots_by_area(plots):
+    return {
+        str(item.get("area_id", "")): item
+        for item in (plots or [])
+        if isinstance(item, dict)
+    }
+
+
+def merge_garden_snapshot_for_save(
+    incoming_plots,
+    existing_plots,
+    owner_user_id: str,
+    existing_updated_at,
+):
+    """
+    구버전 클라이언트가 bloom/timing 필드 없이 다시 동기화해도,
+    서버가 이미 보강한 필드를 같은 꽃/같은 단계에는 유지합니다.
+
+    새 버전 클라이언트가 완전한 필드를 보내는 경우에는 그대로 신뢰합니다.
+    """
+    incoming = sanitize_garden_plots(incoming_plots)
+    if incoming is None:
+        return None
+
+    existing = upgrade_legacy_garden_plots(
+        existing_plots,
+        owner_user_id,
+        existing_updated_at,
+    ) if existing_plots is not None else sanitize_garden_plots([])
+    existing_map = _plots_by_area(existing)
+
+    merged = []
+    now_dt = datetime.now(timezone.utc)
+
+    for raw in incoming:
+        item = dict(raw)
+        area_id = str(item.get("area_id", ""))
+        prev = existing_map.get(area_id)
+
+        is_planted = (
+            bool(item.get("unlocked", False))
+            and bool(item.get("flower_id", ""))
+            and int(item.get("stage", 0)) > 0
+        )
+
+        # 빈 화단/잠금 화단은 기존 꽃 메타데이터를 이어받지 않습니다.
+        if not is_planted:
+            merged.append(item)
+            continue
+
+        incoming_complete = (
+            bool(item.get("bloom_id", ""))
+            and float(item.get("growth_finish_unix", 0.0) or 0.0) > 0.0
+            and float(item.get("stage_duration_seconds", 0.0) or 0.0) > 0.0
+        )
+
+        if incoming_complete:
+            merged.append(item)
+            continue
+
+        same_legacy_plant = False
+        if prev:
+            same_legacy_plant = (
+                str(prev.get("flower_id", "")) == str(item.get("flower_id", ""))
+                and int(prev.get("stage", 0)) == int(item.get("stage", 0))
+                and bool(prev.get("fully_grown", False)) == bool(item.get("fully_grown", False))
+            )
+
+        if same_legacy_plant:
+            if not str(item.get("bloom_id", "")):
+                item["bloom_id"] = str(prev.get("bloom_id", ""))
+            if float(item.get("growth_finish_unix", 0.0) or 0.0) <= 0.0:
+                item["growth_finish_unix"] = float(prev.get("growth_finish_unix", 0.0) or 0.0)
+            if float(item.get("stage_duration_seconds", 0.0) or 0.0) <= 0.0:
+                item["stage_duration_seconds"] = float(prev.get("stage_duration_seconds", 0.0) or 0.0)
+
+        # 여전히 비어 있는 legacy 필드는 루프가 끝난 뒤 3개 area 전체를 한 번에 보강합니다.
+        merged.append(item)
+
+    upgraded_merged = upgrade_legacy_garden_plots(
+        merged,
+        owner_user_id,
+        now_dt,
+    )
+    return sanitize_garden_plots(upgraded_merged)
+
+
 def save_garden_snapshot(user_id: str, raw_plots):
     if not DATABASE_URL:
         return False, "account_db_unavailable", "꽃밭 저장소가 아직 연결되지 않았어요."
 
-    plots = sanitize_garden_plots(raw_plots)
-    if plots is None:
+    incoming = sanitize_garden_plots(raw_plots)
+    if incoming is None:
         return False, "invalid_garden_snapshot", "꽃밭 정보를 확인할 수 없어요."
 
     try:
-        plots_json = json.dumps(plots, ensure_ascii=False)
         with get_account_db_connection() as conn:
             with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT plots, updated_at
+                    FROM gardener_garden_snapshots
+                    WHERE owner_user_id = %s
+                    FOR UPDATE
+                    """,
+                    (user_id,),
+                )
+                row = cur.fetchone()
+
+                existing_plots = None
+                existing_updated_at = datetime.now(timezone.utc)
+                if row:
+                    existing_plots = row[0]
+                    if isinstance(existing_plots, str):
+                        existing_plots = json.loads(existing_plots)
+                    existing_updated_at = row[1]
+
+                plots = merge_garden_snapshot_for_save(
+                    incoming,
+                    existing_plots,
+                    user_id,
+                    existing_updated_at,
+                )
+                if plots is None:
+                    return False, "invalid_garden_snapshot", "꽃밭 정보를 확인할 수 없어요."
+
+                plots_json = json.dumps(plots, ensure_ascii=False)
                 cur.execute(
                     """
                     INSERT INTO gardener_garden_snapshots (
@@ -1331,11 +1556,13 @@ def load_garden_snapshot(requester_user_id: str, owner_garden_number: str):
 
         with get_account_db_connection() as conn:
             with conn.cursor() as cur:
+                # 기존 스냅샷의 legacy 필드를 이 요청에서 바로 보강하고 DB에 저장합니다.
                 cur.execute(
                     """
-                    SELECT plots
+                    SELECT plots, updated_at
                     FROM gardener_garden_snapshots
                     WHERE owner_user_id = %s
+                    FOR UPDATE
                     """,
                     (owner_user_id,),
                 )
@@ -1343,11 +1570,29 @@ def load_garden_snapshot(requester_user_id: str, owner_garden_number: str):
                 if row:
                     has_snapshot = True
                     raw_plots = row[0]
+                    snapshot_updated_at = row[1]
                     if isinstance(raw_plots, str):
                         raw_plots = json.loads(raw_plots)
+
                     sanitized = sanitize_garden_plots(raw_plots)
-                    if sanitized is not None:
-                        plots = resolve_garden_growth(sanitized)
+                    upgraded = upgrade_legacy_garden_plots(
+                        raw_plots,
+                        owner_user_id,
+                        snapshot_updated_at,
+                    )
+                    if upgraded is not None:
+                        # bloom_id/완료시각만 보강해 영구 저장합니다.
+                        # updated_at 자체는 바꾸지 않아 기존 꽃의 시간 기준점이 유지됩니다.
+                        if sanitized != upgraded:
+                            cur.execute(
+                                """
+                                UPDATE gardener_garden_snapshots
+                                SET plots = %s::jsonb
+                                WHERE owner_user_id = %s
+                                """,
+                                (json.dumps(upgraded, ensure_ascii=False), owner_user_id),
+                            )
+                        plots = resolve_garden_growth(upgraded)
 
                 if not is_owner:
                     cur.execute(
@@ -1363,6 +1608,7 @@ def load_garden_snapshot(requester_user_id: str, owner_garden_number: str):
                         (str(r[0]), str(r[1]))
                         for r in cur.fetchall()
                     }
+            conn.commit()
 
         if not plots:
             plots = sanitize_garden_plots([])
@@ -1434,7 +1680,7 @@ def steal_garden_flower(
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT plots
+                    SELECT plots, updated_at
                     FROM gardener_garden_snapshots
                     WHERE owner_user_id = %s
                     FOR UPDATE
@@ -1446,10 +1692,30 @@ def steal_garden_flower(
                     return False, "garden_not_synced", "친구 꽃밭 정보가 아직 없어요.", ""
 
                 raw_plots = row[0]
+                snapshot_updated_at = row[1]
                 if isinstance(raw_plots, str):
                     raw_plots = json.loads(raw_plots)
-                # 주인이 오프라인이어도 완료시각이 지났다면 여기서 즉시 만개로 판정합니다.
-                plots = resolve_garden_growth(raw_plots)
+
+                # 구버전 꽃밭도 여기서 bloom/timer를 보강한 뒤 실제 시각 기준으로 판정합니다.
+                sanitized = sanitize_garden_plots(raw_plots)
+                upgraded = upgrade_legacy_garden_plots(
+                    raw_plots,
+                    owner_user_id,
+                    snapshot_updated_at,
+                )
+                if upgraded is None:
+                    return False, "invalid_garden_snapshot", "친구 꽃밭 정보를 확인할 수 없어요.", ""
+                if sanitized != upgraded:
+                    cur.execute(
+                        """
+                        UPDATE gardener_garden_snapshots
+                        SET plots = %s::jsonb
+                        WHERE owner_user_id = %s
+                        """,
+                        (json.dumps(upgraded, ensure_ascii=False), owner_user_id),
+                    )
+
+                plots = resolve_garden_growth(upgraded)
 
                 target = None
                 for plot in plots:
