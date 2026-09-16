@@ -1,3 +1,4 @@
+# 2026-09-16 긴급수정: 함께하는 정원 100,000송이 + 기존 10%/25% 미지급 보상 1회 복구 + 이후 공동보상 정상지급
 # 2026-09-16 운영자 요청: 기존 개발자(PC) Lv.50 / 정원번호 806956 계정을 1회 안전 삭제
 # FlowerGarden Render server - legacy friend garden auto-migration for existing users 2026-09-16
 # - old snapshots without bloom/timing metadata are upgraded server-side
@@ -43,7 +44,7 @@ ACCOUNT_LOOKUP_COOLDOWN_SECONDS = 1.0
 # 🌼 함께하는 정원 - 서버 공동 이벤트
 # ==================================================
 TOGETHER_GARDEN_EVENT_ID = "first_tree_20260915"
-TOGETHER_GARDEN_TARGET_FLOWERS = 1000
+TOGETHER_GARDEN_TARGET_FLOWERS = 100000
 TOGETHER_GARDEN_REWARD_MILESTONES = (10, 25, 50, 75, 100)
 TOGETHER_GARDEN_MAX_HARVEST_PER_ACTION = 100
 TRANSFER_CODE_LENGTH = 8
@@ -424,6 +425,59 @@ def run_one_time_account_cleanup() -> None:
         )
 
 
+
+def run_one_time_together_garden_reward_recovery() -> None:
+    """기존 1,000송이 목표에서 이미 통과한 10%/25% 미지급 보상을 1회 복구합니다."""
+    if not DATABASE_URL:
+        return
+
+    migration_id = "together_garden_reward_recovery_10_25_20260916"
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS server_admin_migrations (
+                        migration_id VARCHAR(120) PRIMARY KEY,
+                        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    "SELECT 1 FROM server_admin_migrations WHERE migration_id = %s",
+                    (migration_id,),
+                )
+                if cur.fetchone() is not None:
+                    return
+
+                for milestone in (10, 25):
+                    cur.execute(
+                        """
+                        INSERT INTO together_garden_reward_delivery (
+                            event_id, user_id, milestone, status, created_at
+                        )
+                        SELECT %s, a.user_id, %s, 'pending', NOW()
+                        FROM gardener_accounts a
+                        ON CONFLICT (event_id, user_id, milestone) DO NOTHING
+                        """,
+                        (TOGETHER_GARDEN_EVENT_ID, milestone),
+                    )
+
+                cur.execute(
+                    "INSERT INTO server_admin_migrations (migration_id) VALUES (%s)",
+                    (migration_id,),
+                )
+            conn.commit()
+
+        print("[함께하는 정원] 기존 10%/25% 미지급 보상 복구 완료")
+    except Exception as exc:
+        print(
+            "[함께하는 정원 보상복구 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
 def count_account_records() -> int:
     if not DATABASE_URL:
         return 0
@@ -598,8 +652,8 @@ def register_account_record(
 
 
 def _ensure_together_garden_reward_rows(cur, user_id: str, total_flowers: int, my_contribution: int):
-    if my_contribution <= 0:
-        return
+    # 공동 달성 보상은 개인 기여량과 관계없이 등록 정원사에게 지급합니다.
+    _ = my_contribution
 
     for milestone in TOGETHER_GARDEN_REWARD_MILESTONES:
         threshold = (TOGETHER_GARDEN_TARGET_FLOWERS * milestone + 99) // 100
@@ -3964,6 +4018,7 @@ async def main():
     account_db_ready = ensure_account_db()
     if account_db_ready:
         run_one_time_account_cleanup()
+        run_one_time_together_garden_reward_recovery()
 
     print("=" * 60)
     print(" FlowerGarden 서버 + 함께하는 정원 공동이벤트 2026-09-15")
