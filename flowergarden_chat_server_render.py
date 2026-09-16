@@ -1,3 +1,4 @@
+# 2026-09-16 운영자 요청: 기존 개발자(PC) Lv.50 / 정원번호 806956 계정을 1회 안전 삭제
 # FlowerGarden Render server - legacy friend garden auto-migration for existing users 2026-09-16
 # - old snapshots without bloom/timing metadata are upgraded server-side
 # - offline growth/steal works without requiring every existing user to open a new APK first
@@ -338,6 +339,89 @@ def ensure_account_db() -> bool:
             f"{type(exc).__name__}: {exc}"
         )
         return False
+
+
+def run_one_time_account_cleanup() -> None:
+    """운영자 요청으로 특정 기존 테스트 계정을 정확히 1회만 삭제합니다.
+
+    안전장치:
+    - 정원번호 806956
+    - 닉네임 개발자(PC)
+    - Lv.50
+    세 조건이 모두 맞을 때만 삭제합니다.
+    삭제 완료 사실을 migration 테이블에 기록하므로 같은 번호가 미래에 재사용돼도
+    다시 삭제되지 않습니다.
+    """
+    if not DATABASE_URL:
+        return
+
+    migration_id = "delete_legacy_dev_pc_806956_20260916"
+    target_garden_number = "806956"
+    target_nickname = "개발자(PC)"
+    target_level = 50
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS server_admin_migrations (
+                        migration_id VARCHAR(120) PRIMARY KEY,
+                        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    "SELECT 1 FROM server_admin_migrations WHERE migration_id = %s",
+                    (migration_id,),
+                )
+                if cur.fetchone() is not None:
+                    return
+
+                cur.execute(
+                    """
+                    SELECT user_id, nickname, level
+                    FROM gardener_accounts
+                    WHERE garden_number = %s
+                    FOR UPDATE
+                    """,
+                    (target_garden_number,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    print("[1회 계정정리] 정원번호 806956 계정을 찾지 못했습니다.")
+                    return
+
+                actual_user_id = str(row[0])
+                actual_nickname = str(row[1])
+                actual_level = int(row[2])
+                if actual_nickname != target_nickname or actual_level != target_level:
+                    print(
+                        "[1회 계정정리] 안전조건 불일치로 삭제하지 않았습니다: "
+                        f"nickname={actual_nickname!r}, level={actual_level}"
+                    )
+                    return
+
+                # gardener_accounts를 참조하는 친구관계/친구요청/꽃밭/선물/이전백업/
+                # 함께하는정원 사용자별 기록은 FK ON DELETE CASCADE로 함께 정리됩니다.
+                cur.execute(
+                    "DELETE FROM gardener_accounts WHERE user_id = %s",
+                    (actual_user_id,),
+                )
+                cur.execute(
+                    "INSERT INTO server_admin_migrations (migration_id) VALUES (%s)",
+                    (migration_id,),
+                )
+            conn.commit()
+        print(
+            "[1회 계정정리] 기존 계정 삭제 완료: "
+            "개발자(PC) / Lv.50 / 정원번호 806956"
+        )
+    except Exception as exc:
+        print(
+            "[1회 계정정리 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 def count_account_records() -> int:
@@ -3878,6 +3962,8 @@ async def handle_client(ws):
 
 async def main():
     account_db_ready = ensure_account_db()
+    if account_db_ready:
+        run_one_time_account_cleanup()
 
     print("=" * 60)
     print(" FlowerGarden 서버 + 함께하는 정원 공동이벤트 2026-09-15")
