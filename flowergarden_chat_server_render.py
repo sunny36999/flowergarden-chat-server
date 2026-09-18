@@ -1,3 +1,4 @@
+# 2026-09-19 친구목록 실제 사용칭호 동기화 최종보정: gardener_accounts에 title_synced 추가 / 기존 계정은 기본 FALSE라 가짜 '초보 정원사' 미표시 / 최신 클라이언트가 title_name을 실제 전송한 경우에만 title_synced=TRUE / 구버전 접속은 기존 칭호를 덮어쓰지 않음 / 친구목록에는 동기화 완료된 실제 사용칭호만 반환 / 기존 쿠폰·운영자선물·친구·꽃밭·채팅 서버 기능 유지
 # 2026-09-19 긴급수정: account_register의 title_name 변수가 정의되지 않아 WebSocket 연결이 끊기던 오류 수정 / title_name 파싱을 handle_account_register 내부로 이동 / 친구목록 현재 사용칭호 연동 및 기존 서버 기능 유지
 # 2026-09-19 친구목록 현재칭호 연동: gardener_accounts.title_name 자동추가 / account_register로 현재 사용 칭호 저장 / friend_list 응답에 title_name 포함 / 기존 쿠폰6자리·운영자선물·친구·꽃밭 기능 유지
 # 2026-09-18 쿠폰코드 시스템 1.0: 운영자센터에서 쿠폰 생성/기간설정/중지 + 게임에서 1계정 1회 사용 + 기존 운영자 선물함으로 안전 지급
@@ -159,6 +160,13 @@ def ensure_account_db() -> bool:
                     ALTER TABLE gardener_accounts
                     ADD COLUMN IF NOT EXISTS title_name VARCHAR(40)
                     NOT NULL DEFAULT '초보 정원사'
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE gardener_accounts
+                    ADD COLUMN IF NOT EXISTS title_synced BOOLEAN
+                    NOT NULL DEFAULT FALSE
                     """
                 )
                 cur.execute(
@@ -781,8 +789,9 @@ def register_account_record(
     if title_name is not None:
         title_name = str(title_name).strip()
         if not title_name:
-            title_name = "초보 정원사"
-        title_name = title_name[:40]
+            title_name = None
+        else:
+            title_name = title_name[:40]
 
     if not user_id or len(user_id) > 80:
         return False, "invalid_user_id", "사용자 정보를 확인할 수 없어요."
@@ -868,6 +877,7 @@ def register_account_record(
                             SET nickname = %s,
                                 level = %s,
                                 title_name = %s,
+                                title_synced = TRUE,
                                 updated_at = NOW()
                             WHERE user_id = %s
                             """,
@@ -882,9 +892,10 @@ def register_account_record(
                             garden_number,
                             level,
                             title_name,
+                            title_synced,
                             updated_at
                         )
-                        VALUES (%s, %s, %s, %s, %s, NOW())
+                        VALUES (%s, %s, %s, %s, %s, %s, NOW())
                         """,
                         (
                             user_id,
@@ -892,6 +903,7 @@ def register_account_record(
                             garden_number,
                             level,
                             title_name or "초보 정원사",
+                            title_name is not None,
                         ),
                     )
 
@@ -1329,7 +1341,12 @@ def get_friend_lists(user_id: str):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT a.nickname, a.garden_number, a.level, a.title_name
+                    SELECT
+                        a.nickname,
+                        a.garden_number,
+                        a.level,
+                        a.title_name,
+                        a.title_synced
                     FROM gardener_friendships f
                     JOIN gardener_accounts a
                       ON a.user_id = CASE
@@ -1342,11 +1359,17 @@ def get_friend_lists(user_id: str):
                     (user_id, user_id, user_id),
                 )
                 for row in cur.fetchall():
+                    title_synced = bool(row[4])
                     friends.append({
                         "nickname": str(row[0]),
                         "garden_number": str(row[1]).strip(),
                         "level": int(row[2]),
-                        "title_name": str(row[3] or "초보 정원사"),
+                        "title_name": (
+                            str(row[3] or "")
+                            if title_synced
+                            else ""
+                        ),
+                        "title_synced": title_synced,
                     })
 
                 cur.execute(
@@ -3690,9 +3713,15 @@ async def handle_account_register(ws, payload: dict):
     nickname = str(payload.get("nickname", "")).strip()
     user_id = str(payload.get("user_id", "")).strip()
     garden_number = str(payload.get("garden_number", "")).strip()
-    title_name = str(payload.get("title_name", "초보 정원사")).strip()
-    if not title_name:
-        title_name = "초보 정원사"
+
+    # 최신 클라이언트만 title_name을 보냅니다.
+    # 구버전이 접속했을 때 기존 실제 칭호를 '초보 정원사'로 덮어쓰지 않습니다.
+    raw_title_name = payload.get("title_name", None)
+    title_name = None
+    if raw_title_name is not None:
+        parsed_title_name = str(raw_title_name).strip()
+        if parsed_title_name:
+            title_name = parsed_title_name
 
     try:
         level = int(payload.get("level", 0))
