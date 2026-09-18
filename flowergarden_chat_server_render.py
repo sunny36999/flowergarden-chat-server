@@ -1,3 +1,4 @@
+# 2026-09-19 친구목록 현재칭호 연동: gardener_accounts.title_name 자동추가 / account_register로 현재 사용 칭호 저장 / friend_list 응답에 title_name 포함 / 기존 쿠폰6자리·운영자선물·친구·꽃밭 기능 유지
 # 2026-09-18 쿠폰코드 시스템 1.0: 운영자센터에서 쿠폰 생성/기간설정/중지 + 게임에서 1계정 1회 사용 + 기존 운영자 선물함으로 안전 지급
 # 2026-09-18 운영자 보상 시스템 1.1: 랜덤/지정 씨앗쿠폰 보상 필드 추가 + 웹 운영자센터 연동 준비
 # 2026-09-18 운영자 보상 시스템 1단계: 전체/특정 유저 발송 DB + 유저검색 + 발송기록 + 게임 미수령/수령확인 API
@@ -150,6 +151,13 @@ def ensure_account_db() -> bool:
                         level INTEGER NOT NULL DEFAULT 0,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE gardener_accounts
+                    ADD COLUMN IF NOT EXISTS title_name VARCHAR(40)
+                    NOT NULL DEFAULT '초보 정원사'
                     """
                 )
                 cur.execute(
@@ -764,10 +772,16 @@ def register_account_record(
     user_id: str,
     garden_number: str,
     level: int,
+    title_name=None,
 ):
     nickname = str(nickname).strip()
     user_id = str(user_id).strip()
     garden_number = str(garden_number).strip()
+    if title_name is not None:
+        title_name = str(title_name).strip()
+        if not title_name:
+            title_name = "초보 정원사"
+        title_name = title_name[:40]
 
     if not user_id or len(user_id) > 80:
         return False, "invalid_user_id", "사용자 정보를 확인할 수 없어요."
@@ -835,16 +849,29 @@ def register_account_record(
                     )
 
                 if own_row:
-                    cur.execute(
-                        """
-                        UPDATE gardener_accounts
-                        SET nickname = %s,
-                            level = %s,
-                            updated_at = NOW()
-                        WHERE user_id = %s
-                        """,
-                        (nickname, level, user_id),
-                    )
+                    if title_name is None:
+                        cur.execute(
+                            """
+                            UPDATE gardener_accounts
+                            SET nickname = %s,
+                                level = %s,
+                                updated_at = NOW()
+                            WHERE user_id = %s
+                            """,
+                            (nickname, level, user_id),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE gardener_accounts
+                            SET nickname = %s,
+                                level = %s,
+                                title_name = %s,
+                                updated_at = NOW()
+                            WHERE user_id = %s
+                            """,
+                            (nickname, level, title_name, user_id),
+                        )
                 else:
                     cur.execute(
                         """
@@ -853,11 +880,18 @@ def register_account_record(
                             nickname,
                             garden_number,
                             level,
+                            title_name,
                             updated_at
                         )
-                        VALUES (%s, %s, %s, %s, NOW())
+                        VALUES (%s, %s, %s, %s, %s, NOW())
                         """,
-                        (user_id, nickname, garden_number, level),
+                        (
+                            user_id,
+                            nickname,
+                            garden_number,
+                            level,
+                            title_name or "초보 정원사",
+                        ),
                     )
 
             conn.commit()
@@ -1294,7 +1328,7 @@ def get_friend_lists(user_id: str):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT a.nickname, a.garden_number, a.level
+                    SELECT a.nickname, a.garden_number, a.level, a.title_name
                     FROM gardener_friendships f
                     JOIN gardener_accounts a
                       ON a.user_id = CASE
@@ -1311,6 +1345,7 @@ def get_friend_lists(user_id: str):
                         "nickname": str(row[0]),
                         "garden_number": str(row[1]).strip(),
                         "level": int(row[2]),
+                        "title_name": str(row[3] or "초보 정원사"),
                     })
 
                 cur.execute(
@@ -3517,6 +3552,9 @@ def validate_join(payload: dict):
     nickname = str(payload.get("nickname", "")).strip()
     user_id = str(payload.get("user_id", "")).strip()
     garden_number = str(payload.get("garden_number", "")).strip()
+    title_name = str(payload.get("title_name", "초보 정원사")).strip()
+    if not title_name:
+        title_name = "초보 정원사"
 
     try:
         level = int(payload.get("level", 0))
@@ -3665,6 +3703,7 @@ async def handle_account_register(ws, payload: dict):
         user_id,
         garden_number,
         level,
+        title_name,
     )
 
     await send_json(
