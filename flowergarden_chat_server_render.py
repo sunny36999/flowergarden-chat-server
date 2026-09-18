@@ -1,3 +1,4 @@
+# 2026-09-18 쿠폰코드 시스템 1.0: 운영자센터에서 쿠폰 생성/기간설정/중지 + 게임에서 1계정 1회 사용 + 기존 운영자 선물함으로 안전 지급
 # 2026-09-18 운영자 보상 시스템 1.1: 랜덤/지정 씨앗쿠폰 보상 필드 추가 + 웹 운영자센터 연동 준비
 # 2026-09-18 운영자 보상 시스템 1단계: 전체/특정 유저 발송 DB + 유저검색 + 발송기록 + 게임 미수령/수령확인 API
 # 2026-09-18 운영자 요청: 테스트 중 중복 생성된 닉네임 '헤라' 계정을 현재 DB에서 전부 1회 안전 삭제
@@ -333,6 +334,64 @@ def ensure_account_db() -> bool:
                     """
                     CREATE INDEX IF NOT EXISTS idx_admin_reward_sends_created
                     ON admin_reward_sends (created_at DESC, send_id DESC)
+                    """
+                )
+
+                # ==================================================
+                # 🎟 쿠폰 코드
+                # ==================================================
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gift_coupons (
+                        coupon_id BIGSERIAL PRIMARY KEY,
+                        code VARCHAR(32) UNIQUE NOT NULL,
+                        title VARCHAR(60) NOT NULL DEFAULT '',
+                        gold INTEGER NOT NULL DEFAULT 0,
+                        water_drops INTEGER NOT NULL DEFAULT 0,
+                        king_water_drops INTEGER NOT NULL DEFAULT 0,
+                        lottery_tickets INTEGER NOT NULL DEFAULT 0,
+                        wait_passes INTEGER NOT NULL DEFAULT 0,
+                        random_seed_coupons INTEGER NOT NULL DEFAULT 0,
+                        choice_seed_coupons INTEGER NOT NULL DEFAULT 0,
+                        note VARCHAR(120) NOT NULL DEFAULT '',
+                        starts_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        ends_at TIMESTAMPTZ NULL,
+                        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        CHECK (gold >= 0),
+                        CHECK (water_drops >= 0),
+                        CHECK (king_water_drops >= 0),
+                        CHECK (lottery_tickets >= 0),
+                        CHECK (wait_passes >= 0),
+                        CHECK (random_seed_coupons >= 0),
+                        CHECK (choice_seed_coupons >= 0)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gift_coupon_claims (
+                        coupon_id BIGINT NOT NULL
+                            REFERENCES gift_coupons(coupon_id) ON DELETE CASCADE,
+                        user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        delivery_id BIGINT NULL
+                            REFERENCES admin_reward_deliveries(delivery_id) ON DELETE SET NULL,
+                        claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (coupon_id, user_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_gift_coupons_created
+                    ON gift_coupons (created_at DESC, coupon_id DESC)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_gift_coupon_claims_user
+                    ON gift_coupon_claims (user_id, claimed_at DESC)
                     """
                 )
 
@@ -3027,6 +3086,398 @@ def ack_operator_reward_delivery(receiver_user_id: str, delivery_id: int):
         return False, "operator_reward_ack_db_error"
 
 
+# ==================================================
+# 🎟 쿠폰 코드
+# ==================================================
+def normalize_coupon_code(value: str) -> str:
+    code = str(value or "").strip().upper()
+    code = re.sub(r"\s+", "", code)
+    return code
+
+
+def is_valid_coupon_code(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z0-9-]{4,32}", value))
+
+
+def parse_admin_datetime(value):
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        # 운영자센터의 timezone 정보가 빠진 경우 KST로 해석합니다.
+        parsed = parsed.replace(tzinfo=KST)
+    return parsed.astimezone(timezone.utc)
+
+
+def format_coupon_kst(dt_value) -> str:
+    if dt_value is None:
+        return "제한 없음"
+    return dt_value.astimezone(KST).strftime("%Y-%m-%d %H:%M")
+
+
+def create_admin_coupon(
+    code: str,
+    title: str,
+    rewards: dict,
+    note: str,
+    starts_at,
+    ends_at,
+):
+    code = normalize_coupon_code(code)
+    title = str(title or "").strip()[:60]
+    note = str(note or "").strip()[:120]
+
+    if not is_valid_coupon_code(code):
+        return False, "invalid_coupon_code", (
+            "쿠폰 코드는 영문 대문자/숫자/하이픈으로 4~32자까지 사용할 수 있어요."
+        ), None
+
+    if not admin_reward_has_value(rewards):
+        return False, "empty_reward", "쿠폰 보상을 하나 이상 입력해주세요.", None
+
+    start_dt = parse_admin_datetime(starts_at)
+    end_dt = parse_admin_datetime(ends_at)
+    if start_dt is None:
+        start_dt = datetime.now(timezone.utc)
+    if end_dt is not None and end_dt <= start_dt:
+        return False, "invalid_coupon_period", (
+            "쿠폰 종료시간은 시작시간보다 뒤여야 합니다."
+        ), None
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO gift_coupons (
+                        code,
+                        title,
+                        gold,
+                        water_drops,
+                        king_water_drops,
+                        lottery_tickets,
+                        wait_passes,
+                        random_seed_coupons,
+                        choice_seed_coupons,
+                        note,
+                        starts_at,
+                        ends_at,
+                        enabled,
+                        created_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, TRUE, NOW()
+                    )
+                    RETURNING coupon_id
+                    """,
+                    (
+                        code,
+                        title,
+                        int(rewards.get("gold", 0)),
+                        int(rewards.get("water_drops", 0)),
+                        int(rewards.get("king_water_drops", 0)),
+                        int(rewards.get("lottery_tickets", 0)),
+                        int(rewards.get("wait_passes", 0)),
+                        int(rewards.get("random_seed_coupons", 0)),
+                        int(rewards.get("choice_seed_coupons", 0)),
+                        note,
+                        start_dt,
+                        end_dt,
+                    ),
+                )
+                coupon_id = int(cur.fetchone()[0])
+            conn.commit()
+        return True, "ok", "쿠폰을 만들었습니다.", coupon_id
+    except psycopg_errors.UniqueViolation:
+        return False, "coupon_code_exists", "이미 사용 중인 쿠폰 코드예요.", None
+    except Exception as exc:
+        print(f"[쿠폰 생성 오류] {type(exc).__name__}: {exc}")
+        return False, "coupon_create_db_error", "쿠폰 생성 중 오류가 발생했어요.", None
+
+
+def list_admin_coupons(limit: int = 100):
+    limit = max(1, min(100, int(limit)))
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        c.coupon_id,
+                        c.code,
+                        c.title,
+                        c.gold,
+                        c.water_drops,
+                        c.king_water_drops,
+                        c.lottery_tickets,
+                        c.wait_passes,
+                        c.random_seed_coupons,
+                        c.choice_seed_coupons,
+                        c.note,
+                        c.starts_at,
+                        c.ends_at,
+                        c.enabled,
+                        c.created_at,
+                        COUNT(cl.user_id) AS claim_count
+                    FROM gift_coupons c
+                    LEFT JOIN gift_coupon_claims cl
+                      ON cl.coupon_id = c.coupon_id
+                    GROUP BY c.coupon_id
+                    ORDER BY c.created_at DESC, c.coupon_id DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+
+        now_utc = datetime.now(timezone.utc)
+        items = []
+        for row in rows:
+            start_dt = row[11]
+            end_dt = row[12]
+            enabled = bool(row[13])
+            if not enabled:
+                status = "stopped"
+            elif start_dt is not None and now_utc < start_dt:
+                status = "scheduled"
+            elif end_dt is not None and now_utc >= end_dt:
+                status = "expired"
+            else:
+                status = "active"
+
+            items.append({
+                "coupon_id": int(row[0]),
+                "code": str(row[1]),
+                "title": str(row[2]),
+                "gold": int(row[3]),
+                "water_drops": int(row[4]),
+                "king_water_drops": int(row[5]),
+                "lottery_tickets": int(row[6]),
+                "wait_passes": int(row[7]),
+                "random_seed_coupons": int(row[8]),
+                "choice_seed_coupons": int(row[9]),
+                "note": str(row[10]),
+                "starts_at": row[11].isoformat() if row[11] else "",
+                "ends_at": row[12].isoformat() if row[12] else "",
+                "starts_at_text": format_coupon_kst(row[11]),
+                "ends_at_text": format_coupon_kst(row[12]),
+                "enabled": enabled,
+                "status": status,
+                "created_at": row[14].isoformat() if row[14] else "",
+                "created_at_text": format_coupon_kst(row[14]),
+                "claim_count": int(row[15]),
+            })
+        return items, ""
+    except Exception as exc:
+        print(f"[쿠폰 목록 오류] {type(exc).__name__}: {exc}")
+        return [], "coupon_list_db_error"
+
+
+def disable_admin_coupon(coupon_id: int):
+    if coupon_id <= 0:
+        return False, "invalid_coupon_id", "잘못된 쿠폰 번호예요."
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE gift_coupons
+                    SET enabled = FALSE
+                    WHERE coupon_id = %s
+                    RETURNING code
+                    """,
+                    (coupon_id,),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        if row is None:
+            return False, "coupon_not_found", "쿠폰을 찾지 못했어요."
+        return True, "ok", f"{str(row[0])} 쿠폰을 중지했습니다."
+    except Exception as exc:
+        print(f"[쿠폰 중지 오류] {type(exc).__name__}: {exc}")
+        return False, "coupon_disable_db_error", "쿠폰 중지 중 오류가 발생했어요."
+
+
+def redeem_gift_coupon(receiver_user_id: str, raw_code: str):
+    code = normalize_coupon_code(raw_code)
+    if not is_valid_coupon_code(code):
+        return False, "invalid_coupon", "쿠폰 코드를 다시 확인해주세요.", None
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                # 같은 쿠폰에 대한 동시 요청도 한 줄씩 처리합니다.
+                cur.execute(
+                    """
+                    SELECT
+                        coupon_id,
+                        code,
+                        title,
+                        gold,
+                        water_drops,
+                        king_water_drops,
+                        lottery_tickets,
+                        wait_passes,
+                        random_seed_coupons,
+                        choice_seed_coupons,
+                        note,
+                        starts_at,
+                        ends_at,
+                        enabled
+                    FROM gift_coupons
+                    WHERE code = %s
+                    FOR UPDATE
+                    """,
+                    (code,),
+                )
+                coupon = cur.fetchone()
+
+                if coupon is None:
+                    return False, "coupon_not_found", "존재하지 않는 쿠폰 코드예요.", None
+
+                coupon_id = int(coupon[0])
+                now_utc = datetime.now(timezone.utc)
+                starts_at = coupon[11]
+                ends_at = coupon[12]
+                enabled = bool(coupon[13])
+
+                if not enabled:
+                    return False, "coupon_stopped", "사용이 종료된 쿠폰이에요.", None
+                if starts_at is not None and now_utc < starts_at:
+                    return False, "coupon_not_started", (
+                        "아직 사용할 수 없는 쿠폰이에요. "
+                        + format_coupon_kst(starts_at)
+                        + "부터 사용할 수 있어요."
+                    ), None
+                if ends_at is not None and now_utc >= ends_at:
+                    return False, "coupon_expired", "사용기간이 끝난 쿠폰이에요.", None
+
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM gift_coupon_claims
+                    WHERE coupon_id = %s
+                      AND user_id = %s
+                    """,
+                    (coupon_id, receiver_user_id),
+                )
+                if cur.fetchone() is not None:
+                    return False, "coupon_already_used", "이미 사용한 쿠폰이에요.", None
+
+                cur.execute(
+                    """
+                    SELECT nickname, garden_number
+                    FROM gardener_accounts
+                    WHERE user_id = %s
+                    """,
+                    (receiver_user_id,),
+                )
+                receiver = cur.fetchone()
+                if receiver is None:
+                    return False, "account_not_found", (
+                        "정원사 계정 정보를 찾지 못했어요."
+                    ), None
+
+                rewards = {
+                    "gold": int(coupon[3]),
+                    "water_drops": int(coupon[4]),
+                    "king_water_drops": int(coupon[5]),
+                    "lottery_tickets": int(coupon[6]),
+                    "wait_passes": int(coupon[7]),
+                    "random_seed_coupons": int(coupon[8]),
+                    "choice_seed_coupons": int(coupon[9]),
+                }
+
+                # 쿠폰 보상도 기존 운영자 선물함 delivery로 만들어
+                # 게임의 저장→ACK→중복방지 흐름을 그대로 사용합니다.
+                cur.execute(
+                    """
+                    INSERT INTO admin_reward_sends (
+                        target_kind,
+                        target_user_id,
+                        target_garden_number,
+                        target_nickname,
+                        gold,
+                        water_drops,
+                        king_water_drops,
+                        lottery_tickets,
+                        wait_passes,
+                        random_seed_coupons,
+                        choice_seed_coupons,
+                        note,
+                        recipient_count,
+                        created_at
+                    ) VALUES (
+                        'user', %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s,
+                        %s, 1, NOW()
+                    )
+                    RETURNING send_id
+                    """,
+                    (
+                        receiver_user_id,
+                        str(receiver[1]).strip(),
+                        str(receiver[0]),
+                        rewards["gold"],
+                        rewards["water_drops"],
+                        rewards["king_water_drops"],
+                        rewards["lottery_tickets"],
+                        rewards["wait_passes"],
+                        rewards["random_seed_coupons"],
+                        rewards["choice_seed_coupons"],
+                        str(coupon[10] or "")[:120],
+                    ),
+                )
+                send_id = int(cur.fetchone()[0])
+
+                cur.execute(
+                    """
+                    INSERT INTO admin_reward_deliveries (
+                        send_id,
+                        receiver_user_id,
+                        created_at,
+                        delivered_at
+                    ) VALUES (%s, %s, NOW(), NULL)
+                    RETURNING delivery_id
+                    """,
+                    (send_id, receiver_user_id),
+                )
+                delivery_id = int(cur.fetchone()[0])
+
+                cur.execute(
+                    """
+                    INSERT INTO gift_coupon_claims (
+                        coupon_id,
+                        user_id,
+                        delivery_id,
+                        claimed_at
+                    ) VALUES (%s, %s, %s, NOW())
+                    """,
+                    (coupon_id, receiver_user_id, delivery_id),
+                )
+            conn.commit()
+
+        return True, "ok", "쿠폰이 등록됐어요! 선물을 확인해주세요.", {
+            "coupon_id": coupon_id,
+            "code": code,
+            "title": str(coupon[2] or ""),
+            "delivery_id": delivery_id,
+        }
+    except psycopg_errors.UniqueViolation:
+        return False, "coupon_already_used", "이미 사용한 쿠폰이에요.", None
+    except Exception as exc:
+        print(f"[쿠폰 사용 오류] {type(exc).__name__}: {exc}")
+        return False, "coupon_redeem_db_error", (
+            "쿠폰 확인 중 오류가 발생했어요. 잠시 후 다시 시도해주세요."
+        ), None
+
+
 async def send_json(ws, payload: dict):
     await ws.send(json.dumps(payload, ensure_ascii=False))
 
@@ -3526,6 +3977,93 @@ async def handle_operator_reward_ack(ws, payload: dict):
             "ok": ok,
             "code": code,
             "delivery_id": delivery_id,
+        },
+    )
+
+
+async def handle_admin_coupon_create(ws, payload: dict):
+    if not await require_admin_auth(ws):
+        return
+
+    rewards_value = payload.get("rewards", {})
+    rewards = (
+        normalize_admin_reward_payload(rewards_value)
+        if isinstance(rewards_value, dict)
+        else {}
+    )
+    ok, code, message, coupon_id = create_admin_coupon(
+        str(payload.get("code", "")),
+        str(payload.get("title", "")),
+        rewards,
+        str(payload.get("note", "")),
+        payload.get("starts_at"),
+        payload.get("ends_at"),
+    )
+    await send_json(
+        ws,
+        {
+            "type": "admin_coupon_create_result",
+            "ok": ok,
+            "code": code,
+            "message": message,
+            "coupon_id": coupon_id,
+            "coupon_code": normalize_coupon_code(payload.get("code", "")),
+        },
+    )
+
+
+async def handle_admin_coupon_list(ws, _payload: dict):
+    if not await require_admin_auth(ws):
+        return
+    items, error_code = list_admin_coupons()
+    await send_json(
+        ws,
+        {
+            "type": "admin_coupon_list_result",
+            "ok": not bool(error_code),
+            "code": error_code or "ok",
+            "items": items,
+        },
+    )
+
+
+async def handle_admin_coupon_disable(ws, payload: dict):
+    if not await require_admin_auth(ws):
+        return
+    try:
+        coupon_id = int(payload.get("coupon_id", 0))
+    except (TypeError, ValueError):
+        coupon_id = 0
+    ok, code, message = disable_admin_coupon(coupon_id)
+    await send_json(
+        ws,
+        {
+            "type": "admin_coupon_disable_result",
+            "ok": ok,
+            "code": code,
+            "message": message,
+            "coupon_id": coupon_id,
+        },
+    )
+
+
+async def handle_coupon_redeem(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    ok, code, message, coupon_info = redeem_gift_coupon(
+        str(state.get("account_user_id", "")),
+        str(payload.get("code", "")),
+    )
+    await send_json(
+        ws,
+        {
+            "type": "coupon_redeem_result",
+            "ok": ok,
+            "code": code,
+            "message": message,
+            "coupon": coupon_info or {},
         },
     )
 
@@ -4721,6 +5259,18 @@ async def handle_client(ws):
 
             elif msg_type == "admin_reward_history":
                 await handle_admin_reward_history(ws, payload)
+
+            elif msg_type == "admin_coupon_create":
+                await handle_admin_coupon_create(ws, payload)
+
+            elif msg_type == "admin_coupon_list":
+                await handle_admin_coupon_list(ws, payload)
+
+            elif msg_type == "admin_coupon_disable":
+                await handle_admin_coupon_disable(ws, payload)
+
+            elif msg_type == "coupon_redeem":
+                await handle_coupon_redeem(ws, payload)
 
             elif msg_type == "operator_reward_inbox":
                 await handle_operator_reward_inbox(ws, payload)
