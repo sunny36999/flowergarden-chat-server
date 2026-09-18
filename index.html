@@ -41,10 +41,18 @@
     .small{font-size:12px;color:var(--muted)}.strong{font-weight:800}.selected{background:#edf5e9;border-radius:10px;padding:10px}
     .message{margin-top:10px;font-size:13px;font-weight:700;min-height:18px}.oktxt{color:#327141}.badtxt{color:#a63c3c}
     .top-actions{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}
+    .coupon-row{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:9px;align-items:center;padding:12px 3px;border-bottom:1px solid #eee7da}
+    .coupon-code{font-weight:900;letter-spacing:.5px;font-size:15px}
+    .badge{display:inline-block;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:800}
+    .badge.active{background:#e5f3df;color:#3e6d44}
+    .badge.scheduled{background:#e8efff;color:#435f96}
+    .badge.expired,.badge.stopped{background:#f5e5e2;color:#934b45}
+    .coupon-actions{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}
+    .coupon-period-custom{margin-top:10px}
     @media(max-width:760px){
       .reward-grid{grid-template-columns:repeat(2,minmax(120px,1fr))}
       .user-row{grid-template-columns:1fr 1fr}.user-row button{grid-column:1/-1}
-      .history-row{grid-template-columns:1fr}.wrap{padding:18px 10px 40px}
+      .history-row{grid-template-columns:1fr}.coupon-row{grid-template-columns:1fr}.coupon-actions{justify-content:flex-start}.wrap{padding:18px 10px 40px}
     }
   </style>
 </head>
@@ -116,6 +124,83 @@
       <div class="message" id="sendMsg"></div>
     </div>
 
+    <div class="card">
+      <div class="top-actions">
+        <div>
+          <div class="section-title">🎟 쿠폰 코드 선물</div>
+          <div class="small">쿠폰을 새로 만들어 카카오톡·유튜브·공지 어디에든 공유할 수 있어요. 한 계정당 같은 쿠폰은 1번만 사용할 수 있습니다.</div>
+        </div>
+        <div class="row">
+          <button class="soft" id="couponPresetBtn">기본 특별보상 채우기</button>
+          <button class="plain" id="couponClearBtn">수량 비우기</button>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:14px">
+        <div class="grow">
+          <label>쿠폰 코드</label>
+          <input id="couponCode" maxlength="32" placeholder="예: 7K3M9P">
+        </div>
+        <button class="plain" id="couponGenerateBtn">자동 생성</button>
+        <div class="grow">
+          <label>쿠폰 이름 (선택)</label>
+          <input id="couponTitle" maxlength="60" placeholder="예: 테스터 감사선물">
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <div class="grow">
+          <label>사용 기간</label>
+          <select id="couponPeriod">
+            <option value="1">지금부터 1일</option>
+            <option value="7" selected>지금부터 7일</option>
+            <option value="30">지금부터 30일</option>
+            <option value="none">종료일 없음</option>
+            <option value="custom">직접 지정</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row coupon-period-custom hidden" id="couponCustomPeriod">
+        <div class="grow">
+          <label>시작 (한국시간 기준으로 입력)</label>
+          <input id="couponStart" type="datetime-local">
+        </div>
+        <div class="grow">
+          <label>종료 (한국시간 기준으로 입력)</label>
+          <input id="couponEnd" type="datetime-local">
+        </div>
+      </div>
+
+      <div class="reward-grid" style="margin-top:14px">
+        <div class="reward-box"><label>👑 왕방울</label><input id="coupon_king_water_drops" type="number" min="0" value="0"></div>
+        <div class="reward-box"><label>💧 물방울</label><input id="coupon_water_drops" type="number" min="0" value="0"></div>
+        <div class="reward-box"><label>💰 골드</label><input id="coupon_gold" type="number" min="0" value="0"></div>
+        <div class="reward-box"><label>🎟 복권</label><input id="coupon_lottery_tickets" type="number" min="0" value="0"></div>
+        <div class="reward-box"><label>⏩ 대기패스권</label><input id="coupon_wait_passes" type="number" min="0" value="0"></div>
+        <div class="reward-box"><label>🎲 랜덤 씨앗쿠폰</label><input id="coupon_random_seed_coupons" type="number" min="0" value="0"></div>
+        <div class="reward-box"><label>🌱 지정 씨앗쿠폰</label><input id="coupon_choice_seed_coupons" type="number" min="0" value="0"></div>
+      </div>
+
+      <div style="margin-top:12px">
+        <label>게임에 표시할 메시지 (선택)</label>
+        <textarea id="couponNote" maxlength="120" placeholder="예: 테스트에 참여해주셔서 감사합니다 🌷"></textarea>
+      </div>
+
+      <div class="row" style="margin-top:12px;justify-content:flex-end">
+        <button class="primary" id="couponCreateBtn">🎟 쿠폰 만들기</button>
+      </div>
+      <div class="message" id="couponMsg"></div>
+
+      <div class="top-actions" style="margin-top:20px">
+        <div class="section-title" style="margin:0">📋 만든 쿠폰</div>
+        <button class="plain" id="couponRefreshBtn">새로고침</button>
+      </div>
+      <div class="result" id="couponResults">
+        <div class="small" style="padding:12px 0">쿠폰 목록을 불러오는 중입니다.</div>
+      </div>
+    </div>
+
     <div class="row">
       <div class="card half">
         <div class="section-title">👥 유저 찾기</div>
@@ -137,7 +222,7 @@
     </div>
 
     <div class="notice">
-      🌱 랜덤 씨앗쿠폰은 사용 시 랜덤 꽃 씨앗 3개, 지정 씨앗쿠폰은 유저가 원하는 꽃을 고르는 방식으로 게임 쪽 수령 기능을 이어서 연결할 예정입니다.
+      🎟 새 쿠폰을 만들 때마다 APK를 다시 올릴 필요는 없습니다. 서버에 쿠폰이 저장되며, 쿠폰 입력 기능이 들어간 게임 버전에서는 새 코드도 바로 사용할 수 있습니다.
     </div>
   </div>
 </div>
@@ -186,6 +271,7 @@ function handleMessage(p){
       $("app").classList.remove("hidden");
       $("password").value="";
       loadHistory();
+      loadCoupons();
       searchUsers("");
     }else{
       msg("loginMsg",p.message||"로그인에 실패했습니다.",false);
@@ -203,6 +289,25 @@ function handleMessage(p){
   }
   else if(p.type==="admin_reward_history_result"){
     renderHistory(p.items||[]);
+  }
+  else if(p.type==="admin_coupon_create_result"){
+    $("couponCreateBtn").disabled=false;
+    if(p.ok){
+      msg("couponMsg",`쿠폰 생성 완료 · ${p.coupon_code||""}`,true);
+      $("couponCode").value="";
+      $("couponTitle").value="";
+      $("couponNote").value="";
+      loadCoupons();
+    }else{
+      msg("couponMsg",p.message||"쿠폰 생성에 실패했습니다.",false);
+    }
+  }
+  else if(p.type==="admin_coupon_list_result"){
+    renderCoupons(p.items||[]);
+  }
+  else if(p.type==="admin_coupon_disable_result"){
+    msg("couponMsg",p.message||"",!!p.ok);
+    loadCoupons();
   }
   else if(p.type==="admin_auth_required"){
     alert("운영자 로그인이 만료되었습니다. 다시 로그인해주세요.");
@@ -273,6 +378,131 @@ function setPreset(){
   rewardKeys.forEach(k=>$(k).value=vals[k]);
 }
 function clearRewards(){ rewardKeys.forEach(k=>$(k).value=0); }
+
+function couponRewardPayload(){
+  const o={};
+  rewardKeys.forEach(k=>o[k]=Math.max(0,parseInt($("coupon_"+k).value||"0",10)||0));
+  return o;
+}
+function setCouponPreset(){
+  const vals={king_water_drops:50,water_drops:100,gold:10000,lottery_tickets:10,wait_passes:10,random_seed_coupons:0,choice_seed_coupons:0};
+  rewardKeys.forEach(k=>$("coupon_"+k).value=vals[k]);
+}
+function clearCouponRewards(){ rewardKeys.forEach(k=>$("coupon_"+k).value=0); }
+function normalizeCouponCode(v){
+  return String(v||"").trim().toUpperCase().replace(/\s+/g,"");
+}
+function generateCouponCode(){
+  // 입력하기 쉬운 6자리 쿠폰 코드.
+  // O/0, I/1처럼 헷갈리기 쉬운 문자는 제외합니다.
+  const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code="";
+  for(let i=0;i<6;i++) code+=chars[Math.floor(Math.random()*chars.length)];
+  $("couponCode").value=code;
+}
+function updateCouponPeriodUI(){
+  const custom=$("couponPeriod").value==="custom";
+  $("couponCustomPeriod").classList.toggle("hidden",!custom);
+}
+function couponPeriodPayload(){
+  const mode=$("couponPeriod").value;
+  const now=new Date();
+
+  if(mode==="custom"){
+    const s=$("couponStart").value;
+    const e=$("couponEnd").value;
+    if(!s || !e) return {error:"직접 지정은 시작시간과 종료시간을 모두 입력해주세요."};
+    const sd=new Date(s), ed=new Date(e);
+    if(Number.isNaN(sd.getTime()) || Number.isNaN(ed.getTime())) return {error:"쿠폰 기간을 다시 확인해주세요."};
+    if(ed<=sd) return {error:"종료시간은 시작시간보다 뒤여야 합니다."};
+    return {starts_at:sd.toISOString(),ends_at:ed.toISOString()};
+  }
+
+  if(mode==="none"){
+    return {starts_at:now.toISOString(),ends_at:null};
+  }
+
+  const days=Math.max(1,parseInt(mode,10)||1);
+  const end=new Date(now.getTime()+days*24*60*60*1000);
+  return {starts_at:now.toISOString(),ends_at:end.toISOString()};
+}
+function createCoupon(){
+  const code=normalizeCouponCode($("couponCode").value);
+  if(!/^[A-Z0-9-]{4,32}$/.test(code)){
+    msg("couponMsg","쿠폰 코드는 영문/숫자/하이픈으로 4~32자까지 입력해주세요.",false);return;
+  }
+  const rewards=couponRewardPayload();
+  if(!Object.values(rewards).some(v=>v>0)){
+    msg("couponMsg","쿠폰 보상을 하나 이상 입력해주세요.",false);return;
+  }
+  const period=couponPeriodPayload();
+  if(period.error){msg("couponMsg",period.error,false);return}
+
+  const summary=rewardSummary(rewards);
+  const periodText=$("couponPeriod").options[$("couponPeriod").selectedIndex].text;
+  if(!confirm(`쿠폰 ${code}를 만들까요?\n\n보상: ${summary}\n기간: ${periodText}\n\n같은 계정은 이 쿠폰을 1번만 사용할 수 있습니다.`)) return;
+
+  $("couponCreateBtn").disabled=true;
+  msg("couponMsg","쿠폰 생성 중...",true);
+  send({
+    type:"admin_coupon_create",
+    code,
+    title:$("couponTitle").value.trim(),
+    rewards,
+    note:$("couponNote").value.trim(),
+    starts_at:period.starts_at,
+    ends_at:period.ends_at
+  });
+}
+function loadCoupons(){ send({type:"admin_coupon_list"}); }
+function couponStatusText(status){
+  return ({active:"사용중",scheduled:"예약",expired:"기간종료",stopped:"중지"})[status]||status;
+}
+function renderCoupons(items){
+  const root=$("couponResults");
+  if(!items.length){root.innerHTML='<div class="small" style="padding:12px 0">아직 만든 쿠폰이 없습니다.</div>';return}
+  root.innerHTML="";
+  items.forEach(x=>{
+    const row=document.createElement("div"); row.className="coupon-row";
+
+    const a=document.createElement("div");
+    const code=document.createElement("div"); code.className="coupon-code"; code.textContent=x.code||"";
+    const title=document.createElement("div"); title.className="small"; title.textContent=x.title||"";
+    a.append(code,title);
+
+    const b=document.createElement("div");
+    const rewards=document.createElement("div"); rewards.textContent=rewardSummary(x)||"보상 없음";
+    const note=document.createElement("div"); note.className="small"; note.textContent=x.note||"";
+    b.append(rewards,note);
+
+    const c=document.createElement("div");
+    const badge=document.createElement("span"); badge.className=`badge ${x.status||""}`; badge.textContent=couponStatusText(x.status);
+    const period=document.createElement("div"); period.className="small";
+    period.textContent=`${x.starts_at_text||"-"} ~ ${x.ends_at_text||"제한 없음"} · 사용 ${x.claim_count||0}명`;
+    c.append(badge,period);
+
+    const actions=document.createElement("div"); actions.className="coupon-actions";
+    const copy=document.createElement("button"); copy.className="soft"; copy.textContent="코드 복사";
+    copy.onclick=async()=>{
+      try{await navigator.clipboard.writeText(x.code||""); msg("couponMsg",`${x.code} 복사 완료`,true);}
+      catch{prompt("아래 쿠폰 코드를 복사해주세요.",x.code||"");}
+    };
+    actions.appendChild(copy);
+
+    if(x.enabled && x.status!=="expired"){
+      const stop=document.createElement("button"); stop.className="plain"; stop.textContent="중지";
+      stop.onclick=()=>{
+        if(confirm(`${x.code} 쿠폰을 중지할까요?\n중지하면 아직 사용하지 않은 사람도 더 이상 사용할 수 없습니다.`)){
+          send({type:"admin_coupon_disable",coupon_id:x.coupon_id});
+        }
+      };
+      actions.appendChild(stop);
+    }
+
+    row.append(a,b,c,actions); root.appendChild(row);
+  });
+}
+
 function loadHistory(){ send({type:"admin_reward_history"}); }
 function renderHistory(items){
   const root=$("historyResults");
@@ -301,6 +531,14 @@ $("sendBtn").onclick=sendReward;
 $("presetBtn").onclick=setPreset;
 $("clearBtn").onclick=clearRewards;
 $("historyBtn").onclick=loadHistory;
+$("couponPresetBtn").onclick=setCouponPreset;
+$("couponClearBtn").onclick=clearCouponRewards;
+$("couponGenerateBtn").onclick=generateCouponCode;
+$("couponPeriod").onchange=updateCouponPeriodUI;
+$("couponCreateBtn").onclick=createCoupon;
+$("couponRefreshBtn").onclick=loadCoupons;
+$("couponCode").addEventListener("input",()=>{$("couponCode").value=normalizeCouponCode($("couponCode").value)});
+updateCouponPeriodUI();
 updateTargetUI();
 connect();
 </script>
