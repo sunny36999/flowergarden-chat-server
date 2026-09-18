@@ -1,3 +1,4 @@
+# 2026-09-18 운영자 보상 시스템 1.1: 랜덤/지정 씨앗쿠폰 보상 필드 추가 + 웹 운영자센터 연동 준비
 # 2026-09-18 운영자 보상 시스템 1단계: 전체/특정 유저 발송 DB + 유저검색 + 발송기록 + 게임 미수령/수령확인 API
 # 2026-09-18 운영자 요청: 테스트 중 중복 생성된 닉네임 '헤라' 계정을 현재 DB에서 전부 1회 안전 삭제
 # 2026-09-16 긴급수정: 함께하는 정원 100,000송이 + 기존 10%/25% 미지급 보상 1회 복구 + 이후 공동보상 정상지급
@@ -59,6 +60,9 @@ ADMIN_DEFAULT_REWARD = {
     "gold": 10000,
     "lottery_tickets": 10,
     "wait_passes": 10,
+    # 씨앗쿠폰은 기본 꾸러미와 별도 보상입니다.
+    "random_seed_coupons": 0,
+    "choice_seed_coupons": 0,
 }
 
 ADMIN_REWARD_MAX_GOLD = 100000000
@@ -272,6 +276,8 @@ def ensure_account_db() -> bool:
                         king_water_drops INTEGER NOT NULL DEFAULT 0,
                         lottery_tickets INTEGER NOT NULL DEFAULT 0,
                         wait_passes INTEGER NOT NULL DEFAULT 0,
+                        random_seed_coupons INTEGER NOT NULL DEFAULT 0,
+                        choice_seed_coupons INTEGER NOT NULL DEFAULT 0,
                         note VARCHAR(120) NOT NULL DEFAULT '',
                         recipient_count INTEGER NOT NULL DEFAULT 0,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -281,10 +287,26 @@ def ensure_account_db() -> bool:
                         CHECK (king_water_drops >= 0),
                         CHECK (lottery_tickets >= 0),
                         CHECK (wait_passes >= 0),
+                        CHECK (random_seed_coupons >= 0),
+                        CHECK (choice_seed_coupons >= 0),
                         CHECK (recipient_count >= 0)
                     )
                     """
                 )
+                # 이미 생성된 운영자 보상 테이블에도 씨앗쿠폰 컬럼을 안전하게 추가합니다.
+                cur.execute(
+                    """
+                    ALTER TABLE admin_reward_sends
+                    ADD COLUMN IF NOT EXISTS random_seed_coupons INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE admin_reward_sends
+                    ADD COLUMN IF NOT EXISTS choice_seed_coupons INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS admin_reward_deliveries (
@@ -2636,6 +2658,12 @@ def normalize_admin_reward_payload(payload: dict):
         "wait_passes": read_int(
             "wait_passes", ADMIN_REWARD_MAX_ITEM_COUNT
         ),
+        "random_seed_coupons": read_int(
+            "random_seed_coupons", ADMIN_REWARD_MAX_ITEM_COUNT
+        ),
+        "choice_seed_coupons": read_int(
+            "choice_seed_coupons", ADMIN_REWARD_MAX_ITEM_COUNT
+        ),
     }
     return rewards
 
@@ -2777,6 +2805,8 @@ def create_admin_reward_send(
                         king_water_drops,
                         lottery_tickets,
                         wait_passes,
+                        random_seed_coupons,
+                        choice_seed_coupons,
                         note,
                         recipient_count,
                         created_at
@@ -2784,6 +2814,7 @@ def create_admin_reward_send(
                     VALUES (
                         %s, %s, %s, %s,
                         %s, %s, %s, %s, %s,
+                        %s, %s,
                         %s, %s, NOW()
                     )
                     RETURNING send_id
@@ -2798,6 +2829,8 @@ def create_admin_reward_send(
                         int(rewards["king_water_drops"]),
                         int(rewards["lottery_tickets"]),
                         int(rewards["wait_passes"]),
+                        int(rewards["random_seed_coupons"]),
+                        int(rewards["choice_seed_coupons"]),
                         note,
                         len(receiver_ids),
                     ),
@@ -2864,6 +2897,8 @@ def load_admin_reward_history(limit: int = 100):
                         s.king_water_drops,
                         s.lottery_tickets,
                         s.wait_passes,
+                        s.random_seed_coupons,
+                        s.choice_seed_coupons,
                         s.note,
                         s.recipient_count,
                         s.created_at,
@@ -2881,7 +2916,7 @@ def load_admin_reward_history(limit: int = 100):
                 )
                 items = []
                 for row in cur.fetchall():
-                    created_at = row[11]
+                    created_at = row[13]
                     items.append({
                         "send_id": int(row[0]),
                         "target_kind": str(row[1]),
@@ -2896,10 +2931,12 @@ def load_admin_reward_history(limit: int = 100):
                         "king_water_drops": int(row[6]),
                         "lottery_tickets": int(row[7]),
                         "wait_passes": int(row[8]),
-                        "note": str(row[9]),
-                        "recipient_count": int(row[10]),
+                        "random_seed_coupons": int(row[9]),
+                        "choice_seed_coupons": int(row[10]),
+                        "note": str(row[11]),
+                        "recipient_count": int(row[12]),
                         "time_text": format_guestbook_time(created_at),
-                        "delivered_count": int(row[12] or 0),
+                        "delivered_count": int(row[14] or 0),
                     })
         return items, ""
     except Exception as exc:
@@ -2925,6 +2962,8 @@ def load_operator_reward_inbox(receiver_user_id: str):
                         s.king_water_drops,
                         s.lottery_tickets,
                         s.wait_passes,
+                        s.random_seed_coupons,
+                        s.choice_seed_coupons,
                         s.note,
                         s.created_at
                     FROM admin_reward_deliveries d
@@ -2946,8 +2985,10 @@ def load_operator_reward_inbox(receiver_user_id: str):
                         "king_water_drops": int(row[4]),
                         "lottery_tickets": int(row[5]),
                         "wait_passes": int(row[6]),
-                        "note": str(row[7]),
-                        "time_text": format_guestbook_time(row[8]),
+                        "random_seed_coupons": int(row[7]),
+                        "choice_seed_coupons": int(row[8]),
+                        "note": str(row[9]),
+                        "time_text": format_guestbook_time(row[10]),
                     })
         return rewards, ""
     except Exception as exc:
