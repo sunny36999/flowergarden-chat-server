@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FlowerGarden 운영자센터</title>
+  <style>
+    :root{
+      --bg:#f8f3e7; --card:#fffdf7; --line:#ddd4bf; --green:#4d7a53;
+      --green2:#e8f1e4; --text:#2f352f; --muted:#7b8179; --danger:#b44747;
+      --danger-bg:#fff0ee; --shadow:0 10px 30px rgba(64,60,46,.10);
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:"Malgun Gothic","Apple SD Gothic Neo",sans-serif}
+    .wrap{max-width:1080px;margin:0 auto;padding:28px 18px 60px}
+    .brand{display:flex;align-items:center;gap:12px;margin-bottom:22px}
+    .logo{width:48px;height:48px;border-radius:50%;display:grid;place-items:center;background:#fff;box-shadow:var(--shadow);font-size:27px}
+    h1{font-size:25px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:var(--shadow);margin-bottom:16px}
+    .hidden{display:none!important}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}
+    .grow{flex:1 1 260px}.half{flex:1 1 420px}
+    label{display:block;font-size:13px;font-weight:700;margin:0 0 6px}
+    input,select,textarea{width:100%;border:1px solid #cfc6b3;border-radius:11px;padding:11px 12px;font:inherit;background:white;color:var(--text)}
+    textarea{min-height:74px;resize:vertical}
+    button{border:0;border-radius:11px;padding:11px 15px;font:inherit;font-weight:700;cursor:pointer}
+    .primary{background:var(--green);color:white}.soft{background:var(--green2);color:#315337}
+    .plain{background:#eee9dd;color:#4a4d48}.danger{background:var(--danger);color:#fff}
+    button:disabled{opacity:.45;cursor:not-allowed}
+    .status{display:inline-flex;align-items:center;gap:7px;padding:7px 10px;border-radius:999px;font-size:12px;background:#eee9dd}
+    .dot{width:8px;height:8px;border-radius:50%;background:#999}.dot.ok{background:#438f52}.dot.bad{background:#bd4848}
+    .section-title{font-size:18px;font-weight:800;margin:0 0 14px}
+    .notice{border:1px solid #e5cf99;background:#fff7dd;border-radius:12px;padding:11px 13px;font-size:13px}
+    .warning{border:1px solid #e3b2ad;background:var(--danger-bg);border-radius:12px;padding:11px 13px;color:#813c3c;font-size:13px}
+    .reward-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px}
+    .reward-box{background:#f7f5ed;border:1px solid #e4decf;border-radius:12px;padding:10px}
+    .reward-box input{margin-top:5px}
+    .result{margin-top:12px;border-top:1px solid #e9e2d4}
+    .user-row,.history-row{display:grid;gap:8px;align-items:center;padding:11px 3px;border-bottom:1px solid #eee7da}
+    .user-row{grid-template-columns:1.2fr .8fr .55fr auto}.history-row{grid-template-columns:1.2fr 2fr .8fr}
+    .small{font-size:12px;color:var(--muted)}.strong{font-weight:800}.selected{background:#edf5e9;border-radius:10px;padding:10px}
+    .message{margin-top:10px;font-size:13px;font-weight:700;min-height:18px}.oktxt{color:#327141}.badtxt{color:#a63c3c}
+    .top-actions{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}
+    @media(max-width:760px){
+      .reward-grid{grid-template-columns:repeat(2,minmax(120px,1fr))}
+      .user-row{grid-template-columns:1fr 1fr}.user-row button{grid-column:1/-1}
+      .history-row{grid-template-columns:1fr}.wrap{padding:18px 10px 40px}
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <div class="logo">🌼</div>
+    <div><h1>FlowerGarden 운영자센터</h1><div class="sub">운영자 전용 · 서버에서 보상과 유저를 관리합니다.</div></div>
+  </div>
+
+  <div class="card" id="loginCard">
+    <div class="top-actions">
+      <div>
+        <div class="section-title">🔐 운영자 로그인</div>
+        <div class="small">Render에 등록한 ADMIN_PASSWORD를 입력하세요. 브라우저에 저장하지 않습니다.</div>
+      </div>
+      <span class="status"><span class="dot" id="connDot"></span><span id="connText">서버 연결 중</span></span>
+    </div>
+    <div class="row" style="margin-top:15px">
+      <div class="grow"><label>운영자 비밀번호</label><input id="password" type="password" autocomplete="current-password" placeholder="비밀번호 입력"></div>
+      <button class="primary" id="loginBtn">로그인</button>
+    </div>
+    <div class="message" id="loginMsg"></div>
+  </div>
+
+  <div id="app" class="hidden">
+    <div class="card">
+      <div class="top-actions">
+        <div><div class="section-title">🎁 보상 발송</div><div class="small">친구 여부와 관계없이 서버 DB 계정에 직접 발송됩니다.</div></div>
+        <div class="row">
+          <button class="soft" id="presetBtn">기본 특별보상 채우기</button>
+          <button class="plain" id="clearBtn">수량 비우기</button>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:14px">
+        <div class="grow">
+          <label>발송 대상</label>
+          <select id="targetKind">
+            <option value="all">전체 유저</option>
+            <option value="user">특정 유저</option>
+          </select>
+        </div>
+        <div class="grow" id="selectedUserBox">
+          <label>선택된 유저</label>
+          <div class="selected" id="selectedUserText">특정 유저 발송 시 아래 유저 검색에서 선택하세요.</div>
+        </div>
+      </div>
+
+      <div class="warning" id="allWarning" style="margin-top:10px">
+        ⚠ 전체 유저 발송입니다. 보내기를 누르면 현재 DB에 등록된 모든 계정에 각자 새 선물이 생성됩니다.
+      </div>
+
+      <div class="reward-grid" style="margin-top:14px">
+        <div class="reward-box"><label>👑 왕방울</label><input id="king_water_drops" type="number" min="0" value="50"></div>
+        <div class="reward-box"><label>💧 물방울</label><input id="water_drops" type="number" min="0" value="100"></div>
+        <div class="reward-box"><label>💰 골드</label><input id="gold" type="number" min="0" value="10000"></div>
+        <div class="reward-box"><label>🎟 복권</label><input id="lottery_tickets" type="number" min="0" value="10"></div>
+        <div class="reward-box"><label>⏩ 대기패스권</label><input id="wait_passes" type="number" min="0" value="10"></div>
+        <div class="reward-box"><label>🎲 랜덤 씨앗쿠폰</label><input id="random_seed_coupons" type="number" min="0" value="0"></div>
+        <div class="reward-box"><label>🌱 지정 씨앗쿠폰</label><input id="choice_seed_coupons" type="number" min="0" value="0"></div>
+      </div>
+
+      <div style="margin-top:12px"><label>메모 (선택)</label><textarea id="note" maxlength="120" placeholder="예: 9/18 테스터 감사선물"></textarea></div>
+
+      <div class="row" style="margin-top:12px;justify-content:flex-end">
+        <button class="danger" id="sendBtn">🎁 보상 보내기</button>
+      </div>
+      <div class="message" id="sendMsg"></div>
+    </div>
+
+    <div class="row">
+      <div class="card half">
+        <div class="section-title">👥 유저 찾기</div>
+        <div class="row">
+          <div class="grow"><input id="searchInput" placeholder="닉네임 또는 정원번호"></div>
+          <button class="primary" id="searchBtn">검색</button>
+          <button class="plain" id="latestBtn">최근 유저</button>
+        </div>
+        <div class="result" id="userResults"><div class="small" style="padding:12px 0">검색 결과가 여기에 표시됩니다.</div></div>
+      </div>
+
+      <div class="card half">
+        <div class="top-actions">
+          <div class="section-title">📜 발송 기록</div>
+          <button class="plain" id="historyBtn">새로고침</button>
+        </div>
+        <div class="result" id="historyResults"><div class="small" style="padding:12px 0">발송 기록을 불러오는 중입니다.</div></div>
+      </div>
+    </div>
+
+    <div class="notice">
+      🌱 랜덤 씨앗쿠폰은 사용 시 랜덤 꽃 씨앗 3개, 지정 씨앗쿠폰은 유저가 원하는 꽃을 고르는 방식으로 게임 쪽 수령 기능을 이어서 연결할 예정입니다.
+    </div>
+  </div>
+</div>
+
+<script>
+const SERVER_URL = "wss://flowergarden-chat-server.onrender.com";
+let ws = null;
+let loggedIn = false;
+let selectedUser = null;
+
+const $ = id => document.getElementById(id);
+const rewardKeys = ["king_water_drops","water_drops","gold","lottery_tickets","wait_passes","random_seed_coupons","choice_seed_coupons"];
+
+function setConnection(ok, text){
+  $("connDot").className = "dot " + (ok ? "ok" : "bad");
+  $("connText").textContent = text;
+}
+function msg(id, text, ok=true){
+  const el=$(id); el.textContent=text||""; el.className="message "+(ok?"oktxt":"badtxt");
+}
+function send(obj){
+  if(!ws || ws.readyState!==WebSocket.OPEN){ alert("서버 연결이 끊겨 있습니다."); return false; }
+  ws.send(JSON.stringify(obj)); return true;
+}
+function connect(){
+  setConnection(false,"서버 연결 중");
+  ws = new WebSocket(SERVER_URL);
+  ws.onopen=()=>setConnection(true,"서버 연결됨");
+  ws.onclose=()=>{
+    setConnection(false,"연결 끊김");
+    loggedIn=false; $("app").classList.add("hidden"); $("loginCard").classList.remove("hidden");
+    setTimeout(connect,3000);
+  };
+  ws.onerror=()=>setConnection(false,"연결 오류");
+  ws.onmessage=(ev)=>{
+    let p; try{p=JSON.parse(ev.data)}catch{return}
+    handleMessage(p);
+  };
+}
+function handleMessage(p){
+  if(p.type==="admin_auth_result"){
+    if(p.ok){
+      loggedIn=true;
+      msg("loginMsg","로그인되었습니다.",true);
+      $("loginCard").classList.add("hidden");
+      $("app").classList.remove("hidden");
+      $("password").value="";
+      loadHistory();
+      searchUsers("");
+    }else{
+      msg("loginMsg",p.message||"로그인에 실패했습니다.",false);
+    }
+  }
+  else if(p.type==="admin_user_search_result"){
+    renderUsers(p.users||[]);
+  }
+  else if(p.type==="admin_reward_send_result"){
+    $("sendBtn").disabled=false;
+    if(p.ok){
+      msg("sendMsg",`발송 완료 · ${p.recipient_count||0}명 · 발송번호 ${p.send_id}`,true);
+      loadHistory();
+    }else msg("sendMsg",p.message||"발송에 실패했습니다.",false);
+  }
+  else if(p.type==="admin_reward_history_result"){
+    renderHistory(p.items||[]);
+  }
+  else if(p.type==="admin_auth_required"){
+    alert("운영자 로그인이 만료되었습니다. 다시 로그인해주세요.");
+  }
+}
+function login(){
+  const password=$("password").value;
+  if(!password){msg("loginMsg","비밀번호를 입력해주세요.",false);return}
+  msg("loginMsg","확인 중...",true);
+  send({type:"admin_auth",password});
+}
+function searchUsers(q){ send({type:"admin_user_search",query:q||""}); }
+function renderUsers(users){
+  const root=$("userResults");
+  if(!users.length){root.innerHTML='<div class="small" style="padding:12px 0">검색된 유저가 없습니다.</div>';return}
+  root.innerHTML="";
+  users.forEach(u=>{
+    const row=document.createElement("div"); row.className="user-row";
+    const a=document.createElement("div"); a.innerHTML=`<span class="strong"></span><div class="small">${u.is_operator?"운영자 계정":""}</div>`; a.querySelector(".strong").textContent=u.nickname;
+    const b=document.createElement("div"); b.innerHTML=`<div class="strong"></div><div class="small">정원번호</div>`; b.querySelector(".strong").textContent=u.garden_number;
+    const c=document.createElement("div"); c.innerHTML=`<div class="strong">Lv.${Number(u.level||0)}</div>`;
+    const btn=document.createElement("button"); btn.className="soft"; btn.textContent="이 유저 선택";
+    btn.onclick=()=>{
+      selectedUser=u; $("targetKind").value="user"; updateTargetUI();
+    };
+    row.append(a,b,c,btn); root.appendChild(row);
+  });
+}
+function updateTargetUI(){
+  const kind=$("targetKind").value;
+  $("allWarning").classList.toggle("hidden",kind!=="all");
+  if(kind==="user" && selectedUser){
+    $("selectedUserText").textContent=`${selectedUser.nickname} · 정원번호 ${selectedUser.garden_number} · Lv.${selectedUser.level}`;
+  }else if(kind==="user"){
+    $("selectedUserText").textContent="아래 유저 검색에서 받을 사람을 선택하세요.";
+  }else{
+    $("selectedUserText").textContent="전체 유저에게 발송됩니다.";
+  }
+}
+function rewardPayload(){
+  const o={};
+  rewardKeys.forEach(k=>o[k]=Math.max(0,parseInt($(k).value||"0",10)||0));
+  return o;
+}
+function rewardSummary(r){
+  const names={king_water_drops:"왕방울",water_drops:"물방울",gold:"G",lottery_tickets:"복권",wait_passes:"대기패스",random_seed_coupons:"랜덤씨앗쿠폰",choice_seed_coupons:"지정씨앗쿠폰"};
+  return rewardKeys.filter(k=>Number(r[k]||0)>0).map(k=>k==="gold"?`${Number(r[k]).toLocaleString()}G`:`${names[k]} ${r[k]}`).join(" · ");
+}
+function sendReward(){
+  const kind=$("targetKind").value;
+  if(kind==="user" && !selectedUser){msg("sendMsg","먼저 받을 유저를 선택해주세요.",false);return}
+  const rewards=rewardPayload();
+  if(!Object.values(rewards).some(v=>v>0)){msg("sendMsg","보상 수량을 하나 이상 입력해주세요.",false);return}
+  const targetText=kind==="all"?"전체 유저":`${selectedUser.nickname} (${selectedUser.garden_number})`;
+  const summary=rewardSummary(rewards);
+  if(!confirm(`${targetText}에게 아래 보상을 발송할까요?\n\n${summary}\n\n발송 후 각 계정에 새 선물이 생성됩니다.`)) return;
+  $("sendBtn").disabled=true; msg("sendMsg","발송 중...",true);
+  send({
+    type:"admin_reward_send",
+    target_kind:kind,
+    target_user_id:kind==="user"?selectedUser.user_id:"",
+    rewards,
+    note:$("note").value.trim()
+  });
+}
+function setPreset(){
+  const vals={king_water_drops:50,water_drops:100,gold:10000,lottery_tickets:10,wait_passes:10,random_seed_coupons:0,choice_seed_coupons:0};
+  rewardKeys.forEach(k=>$(k).value=vals[k]);
+}
+function clearRewards(){ rewardKeys.forEach(k=>$(k).value=0); }
+function loadHistory(){ send({type:"admin_reward_history"}); }
+function renderHistory(items){
+  const root=$("historyResults");
+  if(!items.length){root.innerHTML='<div class="small" style="padding:12px 0">아직 발송 기록이 없습니다.</div>';return}
+  root.innerHTML="";
+  items.forEach(x=>{
+    const row=document.createElement("div"); row.className="history-row";
+    const target=x.target_kind==="all"?"전체 유저":`${x.target_nickname||"유저"} (${x.target_garden_number||"-"})`;
+    const rewards=rewardSummary(x);
+    const a=document.createElement("div"); a.innerHTML=`<div class="strong"></div><div class="small"></div>`;
+    a.children[0].textContent=target; a.children[1].textContent=x.time_text||"";
+    const b=document.createElement("div"); b.innerHTML=`<div></div><div class="small"></div>`;
+    b.children[0].textContent=rewards||"보상 없음"; b.children[1].textContent=x.note||"";
+    const c=document.createElement("div"); c.innerHTML=`<div class="strong">${x.delivered_count||0}/${x.recipient_count||0}</div><div class="small">수령 완료</div>`;
+    row.append(a,b,c); root.appendChild(row);
+  });
+}
+
+$("loginBtn").onclick=login;
+$("password").addEventListener("keydown",e=>{if(e.key==="Enter")login()});
+$("targetKind").onchange=updateTargetUI;
+$("searchBtn").onclick=()=>searchUsers($("searchInput").value.trim());
+$("latestBtn").onclick=()=>{ $("searchInput").value=""; searchUsers(""); };
+$("searchInput").addEventListener("keydown",e=>{if(e.key==="Enter")searchUsers($("searchInput").value.trim())});
+$("sendBtn").onclick=sendReward;
+$("presetBtn").onclick=setPreset;
+$("clearBtn").onclick=clearRewards;
+$("historyBtn").onclick=loadHistory;
+updateTargetUI();
+connect();
+</script>
+</body>
+</html>
