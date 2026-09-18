@@ -1,3 +1,4 @@
+# 2026-09-18 운영자 보상 시스템 1단계: 전체/특정 유저 발송 DB + 유저검색 + 발송기록 + 게임 미수령/수령확인 API
 # 2026-09-18 운영자 요청: 테스트 중 중복 생성된 닉네임 '헤라' 계정을 현재 DB에서 전부 1회 안전 삭제
 # 2026-09-16 긴급수정: 함께하는 정원 100,000송이 + 기존 10%/25% 미지급 보상 1회 복구 + 이후 공동보상 정상지급
 # 2026-09-16 운영자 요청: 기존 개발자(PC) Lv.50 / 정원번호 806956 계정을 1회 안전 삭제
@@ -40,6 +41,28 @@ MAX_MESSAGE_LENGTH = 100
 # 정원번호/닉네임/레벨이 서버 재시작·재배포 후에도 유지됩니다.
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 ACCOUNT_LOOKUP_COOLDOWN_SECONDS = 1.0
+
+# ==================================================
+# 🎁 운영자 보상 시스템
+# ==================================================
+# 웹 운영자센터 비밀번호는 코드에 적지 않고 Render Environment의
+# ADMIN_PASSWORD 환경변수에만 저장합니다.
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "").strip()
+
+# 게임 안 운영자 계정은 닉네임이 아니라 정원번호로 확인합니다.
+ADMIN_GARDEN_NUMBER = "871511"
+
+# 사용자가 확정한 기본 운영자 특별보상
+ADMIN_DEFAULT_REWARD = {
+    "king_water_drops": 50,
+    "water_drops": 100,
+    "gold": 10000,
+    "lottery_tickets": 10,
+    "wait_passes": 10,
+}
+
+ADMIN_REWARD_MAX_GOLD = 100000000
+ADMIN_REWARD_MAX_ITEM_COUNT = 1000000
 
 # ==================================================
 # 🌼 함께하는 정원 - 서버 공동 이벤트
@@ -235,6 +258,62 @@ def ensure_account_db() -> bool:
                     )
                     """
                 )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS admin_reward_sends (
+                        send_id BIGSERIAL PRIMARY KEY,
+                        target_kind VARCHAR(12) NOT NULL,
+                        target_user_id VARCHAR(80) NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE SET NULL,
+                        target_garden_number CHAR(6) NULL,
+                        target_nickname VARCHAR(12) NULL,
+                        gold INTEGER NOT NULL DEFAULT 0,
+                        water_drops INTEGER NOT NULL DEFAULT 0,
+                        king_water_drops INTEGER NOT NULL DEFAULT 0,
+                        lottery_tickets INTEGER NOT NULL DEFAULT 0,
+                        wait_passes INTEGER NOT NULL DEFAULT 0,
+                        note VARCHAR(120) NOT NULL DEFAULT '',
+                        recipient_count INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        CHECK (target_kind IN ('all', 'user')),
+                        CHECK (gold >= 0),
+                        CHECK (water_drops >= 0),
+                        CHECK (king_water_drops >= 0),
+                        CHECK (lottery_tickets >= 0),
+                        CHECK (wait_passes >= 0),
+                        CHECK (recipient_count >= 0)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS admin_reward_deliveries (
+                        delivery_id BIGSERIAL PRIMARY KEY,
+                        send_id BIGINT NOT NULL
+                            REFERENCES admin_reward_sends(send_id) ON DELETE CASCADE,
+                        receiver_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        delivered_at TIMESTAMPTZ NULL,
+                        UNIQUE (send_id, receiver_user_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_admin_reward_delivery_pending
+                    ON admin_reward_deliveries (
+                        receiver_user_id, delivered_at, created_at
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_admin_reward_sends_created
+                    ON admin_reward_sends (created_at DESC, send_id DESC)
+                    """
+                )
+
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS gardener_transfer_backups (
@@ -2533,6 +2612,380 @@ def format_remaining(seconds: int) -> str:
     return f"{minutes}분"
 
 
+
+def normalize_admin_reward_payload(payload: dict):
+    """운영자 발송 수량을 정수/허용범위로 안전하게 정리합니다."""
+    def read_int(key: str, maximum: int) -> int:
+        try:
+            value = int(payload.get(key, 0))
+        except (TypeError, ValueError):
+            value = 0
+        return max(0, min(maximum, value))
+
+    rewards = {
+        "king_water_drops": read_int(
+            "king_water_drops", ADMIN_REWARD_MAX_ITEM_COUNT
+        ),
+        "water_drops": read_int(
+            "water_drops", ADMIN_REWARD_MAX_ITEM_COUNT
+        ),
+        "gold": read_int("gold", ADMIN_REWARD_MAX_GOLD),
+        "lottery_tickets": read_int(
+            "lottery_tickets", ADMIN_REWARD_MAX_ITEM_COUNT
+        ),
+        "wait_passes": read_int(
+            "wait_passes", ADMIN_REWARD_MAX_ITEM_COUNT
+        ),
+    }
+    return rewards
+
+
+def admin_reward_has_value(rewards: dict) -> bool:
+    return any(int(value) > 0 for value in rewards.values())
+
+
+def search_admin_accounts(query: str, limit: int = 100):
+    query = str(query).strip()
+    limit = max(1, min(100, int(limit)))
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                if query:
+                    like_query = "%" + query + "%"
+                    cur.execute(
+                        """
+                        SELECT user_id, nickname, garden_number, level, updated_at
+                        FROM gardener_accounts
+                        WHERE nickname ILIKE %s
+                           OR garden_number LIKE %s
+                        ORDER BY
+                            CASE WHEN garden_number = %s THEN 0 ELSE 1 END,
+                            LOWER(nickname),
+                            garden_number
+                        LIMIT %s
+                        """,
+                        (like_query, like_query, query, limit),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT user_id, nickname, garden_number, level, updated_at
+                        FROM gardener_accounts
+                        ORDER BY updated_at DESC, garden_number
+                        LIMIT %s
+                        """,
+                        (limit,),
+                    )
+
+                users = []
+                for row in cur.fetchall():
+                    users.append({
+                        "user_id": str(row[0]),
+                        "nickname": str(row[1]),
+                        "garden_number": str(row[2]).strip(),
+                        "level": int(row[3]),
+                        "is_operator": (
+                            str(row[2]).strip() == ADMIN_GARDEN_NUMBER
+                        ),
+                    })
+        return users, ""
+    except Exception as exc:
+        print(
+            "[운영자 유저검색 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return [], "admin_user_search_db_error"
+
+
+def create_admin_reward_send(
+    target_kind: str,
+    target_user_id: str,
+    rewards: dict,
+    note: str,
+):
+    target_kind = str(target_kind).strip().lower()
+    target_user_id = str(target_user_id).strip()
+    note = str(note).strip()[:120]
+
+    if target_kind not in ("all", "user"):
+        return False, "invalid_target_kind", "발송 대상을 확인해주세요.", 0, 0, []
+
+    if not admin_reward_has_value(rewards):
+        return False, "empty_reward", "보상이 하나도 설정되지 않았어요.", 0, 0, []
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                target_garden_number = None
+                target_nickname = None
+                receiver_ids = []
+
+                if target_kind == "user":
+                    cur.execute(
+                        """
+                        SELECT user_id, nickname, garden_number
+                        FROM gardener_accounts
+                        WHERE user_id = %s
+                        FOR UPDATE
+                        """,
+                        (target_user_id,),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        return (
+                            False,
+                            "target_not_found",
+                            "선택한 정원사 계정을 찾을 수 없어요.",
+                            0,
+                            0,
+                            [],
+                        )
+                    target_user_id = str(row[0])
+                    target_nickname = str(row[1])
+                    target_garden_number = str(row[2]).strip()
+                    receiver_ids = [target_user_id]
+                else:
+                    cur.execute(
+                        """
+                        SELECT user_id
+                        FROM gardener_accounts
+                        ORDER BY user_id
+                        """
+                    )
+                    receiver_ids = [str(row[0]) for row in cur.fetchall()]
+
+                if not receiver_ids:
+                    return (
+                        False,
+                        "no_recipients",
+                        "보상을 받을 등록 계정이 아직 없어요.",
+                        0,
+                        0,
+                        [],
+                    )
+
+                cur.execute(
+                    """
+                    INSERT INTO admin_reward_sends (
+                        target_kind,
+                        target_user_id,
+                        target_garden_number,
+                        target_nickname,
+                        gold,
+                        water_drops,
+                        king_water_drops,
+                        lottery_tickets,
+                        wait_passes,
+                        note,
+                        recipient_count,
+                        created_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s, NOW()
+                    )
+                    RETURNING send_id
+                    """,
+                    (
+                        target_kind,
+                        target_user_id if target_kind == "user" else None,
+                        target_garden_number,
+                        target_nickname,
+                        int(rewards["gold"]),
+                        int(rewards["water_drops"]),
+                        int(rewards["king_water_drops"]),
+                        int(rewards["lottery_tickets"]),
+                        int(rewards["wait_passes"]),
+                        note,
+                        len(receiver_ids),
+                    ),
+                )
+                send_row = cur.fetchone()
+                send_id = int(send_row[0]) if send_row else 0
+
+                cur.executemany(
+                    """
+                    INSERT INTO admin_reward_deliveries (
+                        send_id,
+                        receiver_user_id,
+                        created_at
+                    )
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (send_id, receiver_user_id) DO NOTHING
+                    """,
+                    [(send_id, user_id) for user_id in receiver_ids],
+                )
+            conn.commit()
+
+        print(
+            "[운영자 보상 발송] "
+            f"send_id={send_id} / 대상={target_kind} / "
+            f"수신 {len(receiver_ids)}명 / {rewards}"
+        )
+        return (
+            True,
+            "ok",
+            "운영자 보상을 발송했습니다.",
+            send_id,
+            len(receiver_ids),
+            receiver_ids,
+        )
+    except Exception as exc:
+        print(
+            "[운영자 보상 발송 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return (
+            False,
+            "admin_reward_db_error",
+            "보상을 발송하지 못했어요. 잠시 후 다시 시도해주세요.",
+            0,
+            0,
+            [],
+        )
+
+
+def load_admin_reward_history(limit: int = 100):
+    limit = max(1, min(100, int(limit)))
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        s.send_id,
+                        s.target_kind,
+                        s.target_garden_number,
+                        s.target_nickname,
+                        s.gold,
+                        s.water_drops,
+                        s.king_water_drops,
+                        s.lottery_tickets,
+                        s.wait_passes,
+                        s.note,
+                        s.recipient_count,
+                        s.created_at,
+                        COUNT(d.delivery_id) FILTER (
+                            WHERE d.delivered_at IS NOT NULL
+                        ) AS delivered_count
+                    FROM admin_reward_sends s
+                    LEFT JOIN admin_reward_deliveries d
+                      ON d.send_id = s.send_id
+                    GROUP BY s.send_id
+                    ORDER BY s.created_at DESC, s.send_id DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                items = []
+                for row in cur.fetchall():
+                    created_at = row[11]
+                    items.append({
+                        "send_id": int(row[0]),
+                        "target_kind": str(row[1]),
+                        "target_garden_number": (
+                            str(row[2]).strip() if row[2] is not None else ""
+                        ),
+                        "target_nickname": (
+                            str(row[3]) if row[3] is not None else ""
+                        ),
+                        "gold": int(row[4]),
+                        "water_drops": int(row[5]),
+                        "king_water_drops": int(row[6]),
+                        "lottery_tickets": int(row[7]),
+                        "wait_passes": int(row[8]),
+                        "note": str(row[9]),
+                        "recipient_count": int(row[10]),
+                        "time_text": format_guestbook_time(created_at),
+                        "delivered_count": int(row[12] or 0),
+                    })
+        return items, ""
+    except Exception as exc:
+        print(
+            "[운영자 발송기록 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return [], "admin_reward_history_db_error"
+
+
+def load_operator_reward_inbox(receiver_user_id: str):
+    rewards = []
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        d.delivery_id,
+                        s.send_id,
+                        s.gold,
+                        s.water_drops,
+                        s.king_water_drops,
+                        s.lottery_tickets,
+                        s.wait_passes,
+                        s.note,
+                        s.created_at
+                    FROM admin_reward_deliveries d
+                    JOIN admin_reward_sends s
+                      ON s.send_id = d.send_id
+                    WHERE d.receiver_user_id = %s
+                      AND d.delivered_at IS NULL
+                    ORDER BY s.created_at ASC, d.delivery_id ASC
+                    LIMIT 100
+                    """,
+                    (receiver_user_id,),
+                )
+                for row in cur.fetchall():
+                    rewards.append({
+                        "delivery_id": int(row[0]),
+                        "send_id": int(row[1]),
+                        "gold": int(row[2]),
+                        "water_drops": int(row[3]),
+                        "king_water_drops": int(row[4]),
+                        "lottery_tickets": int(row[5]),
+                        "wait_passes": int(row[6]),
+                        "note": str(row[7]),
+                        "time_text": format_guestbook_time(row[8]),
+                    })
+        return rewards, ""
+    except Exception as exc:
+        print(
+            "[운영자 보상함 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return [], "operator_reward_inbox_db_error"
+
+
+def ack_operator_reward_delivery(receiver_user_id: str, delivery_id: int):
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE admin_reward_deliveries
+                    SET delivered_at = COALESCE(delivered_at, NOW())
+                    WHERE delivery_id = %s
+                      AND receiver_user_id = %s
+                    RETURNING send_id, delivered_at
+                    """,
+                    (delivery_id, receiver_user_id),
+                )
+                row = cur.fetchone()
+            conn.commit()
+
+        if row is None:
+            return False, "delivery_not_found"
+        return True, "ok"
+    except Exception as exc:
+        print(
+            "[운영자 보상 수령확인 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return False, "operator_reward_ack_db_error"
+
+
 async def send_json(ws, payload: dict):
     await ws.send(json.dumps(payload, ensure_ascii=False))
 
@@ -2838,6 +3291,222 @@ async def require_registered_account(ws):
         },
     )
     return False
+
+
+
+async def require_admin_auth(ws):
+    state = clients[ws]
+    if state.get("admin_authenticated"):
+        return True
+    await send_json(
+        ws,
+        {
+            "type": "admin_auth_required",
+            "ok": False,
+            "message": "운영자 로그인이 필요합니다.",
+        },
+    )
+    return False
+
+
+async def handle_admin_auth(ws, payload: dict):
+    import hmac
+
+    password = str(payload.get("password", ""))
+    if not ADMIN_PASSWORD:
+        await send_json(
+            ws,
+            {
+                "type": "admin_auth_result",
+                "ok": False,
+                "code": "admin_password_not_configured",
+                "message": (
+                    "Render Environment에 ADMIN_PASSWORD가 아직 설정되지 않았습니다."
+                ),
+            },
+        )
+        return
+
+    ok = hmac.compare_digest(password, ADMIN_PASSWORD)
+    clients[ws]["admin_authenticated"] = ok
+
+    await send_json(
+        ws,
+        {
+            "type": "admin_auth_result",
+            "ok": ok,
+            "code": "ok" if ok else "wrong_password",
+            "message": (
+                "운영자 로그인 완료"
+                if ok
+                else "운영자 비밀번호가 맞지 않습니다."
+            ),
+            "default_reward": ADMIN_DEFAULT_REWARD if ok else {},
+        },
+    )
+
+
+async def handle_admin_user_search(ws, payload: dict):
+    if not await require_admin_auth(ws):
+        return
+
+    query = str(payload.get("query", "")).strip()
+    users, error_code = search_admin_accounts(query)
+    await send_json(
+        ws,
+        {
+            "type": "admin_user_search_result",
+            "ok": not bool(error_code),
+            "code": error_code or "ok",
+            "users": users,
+            "query": query,
+        },
+    )
+
+
+async def handle_admin_reward_history(ws, _payload: dict):
+    if not await require_admin_auth(ws):
+        return
+
+    items, error_code = load_admin_reward_history()
+    await send_json(
+        ws,
+        {
+            "type": "admin_reward_history_result",
+            "ok": not bool(error_code),
+            "code": error_code or "ok",
+            "items": items,
+        },
+    )
+
+
+async def handle_admin_reward_send(ws, payload: dict):
+    if not await require_admin_auth(ws):
+        return
+
+    target_kind = str(payload.get("target_kind", "")).strip().lower()
+    target_user_id = str(payload.get("target_user_id", "")).strip()
+    note = str(payload.get("note", "")).strip()
+    rewards_value = payload.get("rewards", {})
+    rewards = (
+        normalize_admin_reward_payload(rewards_value)
+        if isinstance(rewards_value, dict)
+        else dict(ADMIN_DEFAULT_REWARD)
+    )
+
+    ok, code, message, send_id, recipient_count, receiver_ids = (
+        create_admin_reward_send(
+            target_kind,
+            target_user_id,
+            rewards,
+            note,
+        )
+    )
+
+    await send_json(
+        ws,
+        {
+            "type": "admin_reward_send_result",
+            "ok": ok,
+            "code": code,
+            "message": message,
+            "send_id": send_id,
+            "recipient_count": recipient_count,
+            "rewards": rewards,
+        },
+    )
+
+    if not ok:
+        return
+
+    notice = {
+        "type": "operator_reward_notice",
+        "send_id": send_id,
+        "message": "🎁 운영자 선물이 도착했어요!",
+    }
+    await asyncio.gather(
+        *(
+            notify_account_user_id(user_id, notice)
+            for user_id in receiver_ids
+        ),
+        return_exceptions=True,
+    )
+
+
+async def handle_operator_reward_inbox(ws, _payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    rewards, error_code = load_operator_reward_inbox(
+        str(state.get("account_user_id", ""))
+    )
+    await send_json(
+        ws,
+        {
+            "type": "operator_reward_inbox_result",
+            "ok": not bool(error_code),
+            "code": error_code or "ok",
+            "rewards": rewards,
+        },
+    )
+
+
+async def handle_operator_reward_ack(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    try:
+        delivery_id = int(payload.get("delivery_id", 0))
+    except (TypeError, ValueError):
+        delivery_id = 0
+
+    if delivery_id <= 0:
+        await send_json(
+            ws,
+            {
+                "type": "operator_reward_ack_result",
+                "ok": False,
+                "code": "invalid_delivery_id",
+                "delivery_id": delivery_id,
+            },
+        )
+        return
+
+    state = clients[ws]
+    ok, code = ack_operator_reward_delivery(
+        str(state.get("account_user_id", "")),
+        delivery_id,
+    )
+    await send_json(
+        ws,
+        {
+            "type": "operator_reward_ack_result",
+            "ok": ok,
+            "code": code,
+            "delivery_id": delivery_id,
+        },
+    )
+
+
+async def handle_operator_status(ws, _payload: dict):
+    if not await require_registered_account(ws):
+        return
+
+    state = clients[ws]
+    is_operator = (
+        str(state.get("garden_number", "")).strip()
+        == ADMIN_GARDEN_NUMBER
+    )
+    await send_json(
+        ws,
+        {
+            "type": "operator_status_result",
+            "ok": True,
+            "is_operator": is_operator,
+            "garden_number": str(state.get("garden_number", "")).strip(),
+        },
+    )
 
 
 async def handle_friend_request(ws, payload: dict):
@@ -3537,6 +4206,30 @@ def prune_report_votes(target_user_id: str):
     return votes
 
 
+async def notify_account_user_id(user_id: str, payload: dict):
+    """광장 입장 여부와 무관하게 계정등록된 현재 연결에 알립니다."""
+    targets = []
+    for ws, state in list(clients.items()):
+        account_match = (
+            state.get("account_registered")
+            and state.get("account_user_id") == user_id
+        )
+        plaza_match = (
+            state.get("joined")
+            and state.get("user_id") == user_id
+        )
+        if account_match or plaza_match:
+            targets.append(ws)
+
+    if not targets:
+        return
+
+    await asyncio.gather(
+        *(send_json(ws, payload) for ws in targets),
+        return_exceptions=True,
+    )
+
+
 async def notify_user_id(user_id: str, payload: dict):
     for ws, state in list(clients.items()):
         if (
@@ -3945,6 +4638,7 @@ async def handle_client(ws):
         "last_account_lookup": 0.0,
         "last_transfer_restore_attempt": 0.0,
         "loaded_transfer_code": "",
+        "admin_authenticated": False,
     }
 
     try:
@@ -3975,7 +4669,28 @@ async def handle_client(ws):
 
             msg_type = payload.get("type")
 
-            if msg_type == "join":
+            if msg_type == "admin_auth":
+                await handle_admin_auth(ws, payload)
+
+            elif msg_type == "admin_user_search":
+                await handle_admin_user_search(ws, payload)
+
+            elif msg_type == "admin_reward_send":
+                await handle_admin_reward_send(ws, payload)
+
+            elif msg_type == "admin_reward_history":
+                await handle_admin_reward_history(ws, payload)
+
+            elif msg_type == "operator_reward_inbox":
+                await handle_operator_reward_inbox(ws, payload)
+
+            elif msg_type == "operator_reward_ack":
+                await handle_operator_reward_ack(ws, payload)
+
+            elif msg_type == "operator_status":
+                await handle_operator_status(ws, payload)
+
+            elif msg_type == "join":
                 await handle_join(ws, payload)
 
             elif msg_type == "account_register":
@@ -4122,6 +4837,11 @@ async def main():
         f"{REPORT_AUTO_MUTE_SECONDS // 60}분 채팅금지"
     )
     print("서버 종료: Ctrl + C")
+    print(
+        "운영자 보상 시스템: 준비"
+        if ADMIN_PASSWORD
+        else "운영자 보상 시스템: ADMIN_PASSWORD 설정 대기"
+    )
     print("=" * 60)
 
     async with serve(
