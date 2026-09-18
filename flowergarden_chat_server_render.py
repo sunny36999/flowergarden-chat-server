@@ -1,3 +1,4 @@
+# 2026-09-18 운영자 요청: 테스트 중 중복 생성된 닉네임 '헤라' 계정을 현재 DB에서 전부 1회 안전 삭제
 # 2026-09-16 긴급수정: 함께하는 정원 100,000송이 + 기존 10%/25% 미지급 보상 1회 복구 + 이후 공동보상 정상지급
 # 2026-09-16 운영자 요청: 기존 개발자(PC) Lv.50 / 정원번호 806956 계정을 1회 안전 삭제
 # FlowerGarden Render server - legacy friend garden auto-migration for existing users 2026-09-16
@@ -425,6 +426,77 @@ def run_one_time_account_cleanup() -> None:
         )
 
 
+
+
+def run_one_time_hera_account_cleanup() -> None:
+    """현재 DB에 남아 있는 테스트 닉네임 '헤라' 계정을 전부 정확히 1회만 삭제합니다.
+
+    - 닉네임이 정확히 '헤라'인 현재 계정만 대상입니다.
+    - 연결된 친구/요청/방명록/꽃밭/선물/이전백업/함께하는정원 기록은
+      기존 FK ON DELETE CASCADE 규칙에 따라 함께 정리됩니다.
+    - 완료 사실을 server_admin_migrations에 기록하므로,
+      이후 새로 만들어지는 '헤라' 계정은 다시 자동 삭제되지 않습니다.
+    """
+    if not DATABASE_URL:
+        return
+
+    migration_id = "delete_all_test_hera_accounts_20260918"
+    target_nickname = "헤라"
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS server_admin_migrations (
+                        migration_id VARCHAR(120) PRIMARY KEY,
+                        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    "SELECT 1 FROM server_admin_migrations WHERE migration_id = %s",
+                    (migration_id,),
+                )
+                if cur.fetchone() is not None:
+                    return
+
+                cur.execute(
+                    """
+                    DELETE FROM gardener_accounts
+                    WHERE nickname = %s
+                    RETURNING user_id, garden_number, level
+                    """,
+                    (target_nickname,),
+                )
+                deleted_rows = cur.fetchall()
+
+                # 삭제 대상이 0명이어도 이번 1회 정리 작업은 완료 처리합니다.
+                # 따라서 이후 새로 생성되는 정상 '헤라' 계정은 삭제되지 않습니다.
+                cur.execute(
+                    "INSERT INTO server_admin_migrations (migration_id) VALUES (%s)",
+                    (migration_id,),
+                )
+
+            conn.commit()
+
+        if deleted_rows:
+            print(
+                f"[1회 헤라 계정정리] 삭제 완료: {len(deleted_rows)}명"
+            )
+            for _user_id, garden_number, level in deleted_rows:
+                print(
+                    "[1회 헤라 계정정리] "
+                    f"헤라 / Lv.{int(level)} / 정원번호 {str(garden_number).strip()}"
+                )
+        else:
+            print("[1회 헤라 계정정리] 삭제할 '헤라' 계정이 없습니다.")
+
+    except Exception as exc:
+        print(
+            "[1회 헤라 계정정리 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 def run_one_time_together_garden_reward_recovery() -> None:
     """기존 1,000송이 목표에서 이미 통과한 10%/25% 미지급 보상을 1회 복구합니다."""
@@ -4018,6 +4090,7 @@ async def main():
     account_db_ready = ensure_account_db()
     if account_db_ready:
         run_one_time_account_cleanup()
+        run_one_time_hera_account_cleanup()
         run_one_time_together_garden_reward_recovery()
 
     print("=" * 60)
