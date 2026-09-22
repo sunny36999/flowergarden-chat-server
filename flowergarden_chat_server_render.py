@@ -1,6 +1,4 @@
-# 2026-09-19 친구목록 실제 사용칭호 동기화 최종보정: gardener_accounts에 title_synced 추가 / 기존 계정은 기본 FALSE라 가짜 '초보 정원사' 미표시 / 최신 클라이언트가 title_name을 실제 전송한 경우에만 title_synced=TRUE / 구버전 접속은 기존 칭호를 덮어쓰지 않음 / 친구목록에는 동기화 완료된 실제 사용칭호만 반환 / 기존 쿠폰·운영자선물·친구·꽃밭·채팅 서버 기능 유지
-# 2026-09-19 긴급수정: account_register의 title_name 변수가 정의되지 않아 WebSocket 연결이 끊기던 오류 수정 / title_name 파싱을 handle_account_register 내부로 이동 / 친구목록 현재 사용칭호 연동 및 기존 서버 기능 유지
-# 2026-09-19 친구목록 현재칭호 연동: gardener_accounts.title_name 자동추가 / account_register로 현재 사용 칭호 저장 / friend_list 응답에 title_name 포함 / 기존 쿠폰6자리·운영자선물·친구·꽃밭 기능 유지
+# 2026-09-22 FlowerGarden 메인 채팅: 최근 50개 DB 유지 / 메인 최신 공개채팅용 history / @닉네임 내용 귓속말(송신자+수신자만 전달·저장) / 기존 신고·제재·친구·방명록·함께하는정원·쿠폰 유지
 # 2026-09-18 쿠폰코드 시스템 1.0: 운영자센터에서 쿠폰 생성/기간설정/중지 + 게임에서 1계정 1회 사용 + 기존 운영자 선물함으로 안전 지급
 # 2026-09-18 운영자 보상 시스템 1.1: 랜덤/지정 씨앗쿠폰 보상 필드 추가 + 웹 운영자센터 연동 준비
 # 2026-09-18 운영자 보상 시스템 1단계: 전체/특정 유저 발송 DB + 유저검색 + 발송기록 + 게임 미수령/수령확인 API
@@ -153,20 +151,6 @@ def ensure_account_db() -> bool:
                         level INTEGER NOT NULL DEFAULT 0,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
-                    """
-                )
-                cur.execute(
-                    """
-                    ALTER TABLE gardener_accounts
-                    ADD COLUMN IF NOT EXISTS title_name VARCHAR(40)
-                    NOT NULL DEFAULT '초보 정원사'
-                    """
-                )
-                cur.execute(
-                    """
-                    ALTER TABLE gardener_accounts
-                    ADD COLUMN IF NOT EXISTS title_synced BOOLEAN
-                    NOT NULL DEFAULT FALSE
                     """
                 )
                 cur.execute(
@@ -432,6 +416,36 @@ def ensure_account_db() -> bool:
                     ON gardener_transfer_backups (owner_user_id, created_at DESC)
                     """
                 )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_chat_messages (
+                        message_id BIGSERIAL PRIMARY KEY,
+                        sender_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        sender_nickname VARCHAR(12) NOT NULL,
+                        message VARCHAR(100) NOT NULL,
+                        whisper_target_user_id VARCHAR(80) NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        whisper_target_nickname VARCHAR(12) NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_chat_messages_created
+                    ON gardener_chat_messages (message_id DESC)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_chat_messages_whisper_target
+                    ON gardener_chat_messages (
+                        whisper_target_user_id, message_id DESC
+                    )
+                    """
+                )
+
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS together_garden_events (
@@ -781,17 +795,10 @@ def register_account_record(
     user_id: str,
     garden_number: str,
     level: int,
-    title_name=None,
 ):
     nickname = str(nickname).strip()
     user_id = str(user_id).strip()
     garden_number = str(garden_number).strip()
-    if title_name is not None:
-        title_name = str(title_name).strip()
-        if not title_name:
-            title_name = None
-        else:
-            title_name = title_name[:40]
 
     if not user_id or len(user_id) > 80:
         return False, "invalid_user_id", "사용자 정보를 확인할 수 없어요."
@@ -859,30 +866,16 @@ def register_account_record(
                     )
 
                 if own_row:
-                    if title_name is None:
-                        cur.execute(
-                            """
-                            UPDATE gardener_accounts
-                            SET nickname = %s,
-                                level = %s,
-                                updated_at = NOW()
-                            WHERE user_id = %s
-                            """,
-                            (nickname, level, user_id),
-                        )
-                    else:
-                        cur.execute(
-                            """
-                            UPDATE gardener_accounts
-                            SET nickname = %s,
-                                level = %s,
-                                title_name = %s,
-                                title_synced = TRUE,
-                                updated_at = NOW()
-                            WHERE user_id = %s
-                            """,
-                            (nickname, level, title_name, user_id),
-                        )
+                    cur.execute(
+                        """
+                        UPDATE gardener_accounts
+                        SET nickname = %s,
+                            level = %s,
+                            updated_at = NOW()
+                        WHERE user_id = %s
+                        """,
+                        (nickname, level, user_id),
+                    )
                 else:
                     cur.execute(
                         """
@@ -891,20 +884,11 @@ def register_account_record(
                             nickname,
                             garden_number,
                             level,
-                            title_name,
-                            title_synced,
                             updated_at
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                        VALUES (%s, %s, %s, %s, NOW())
                         """,
-                        (
-                            user_id,
-                            nickname,
-                            garden_number,
-                            level,
-                            title_name or "초보 정원사",
-                            title_name is not None,
-                        ),
+                        (user_id, nickname, garden_number, level),
                     )
 
             conn.commit()
@@ -1341,12 +1325,7 @@ def get_friend_lists(user_id: str):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT
-                        a.nickname,
-                        a.garden_number,
-                        a.level,
-                        a.title_name,
-                        a.title_synced
+                    SELECT a.nickname, a.garden_number, a.level
                     FROM gardener_friendships f
                     JOIN gardener_accounts a
                       ON a.user_id = CASE
@@ -1359,17 +1338,10 @@ def get_friend_lists(user_id: str):
                     (user_id, user_id, user_id),
                 )
                 for row in cur.fetchall():
-                    title_synced = bool(row[4])
                     friends.append({
                         "nickname": str(row[0]),
                         "garden_number": str(row[1]).strip(),
                         "level": int(row[2]),
-                        "title_name": (
-                            str(row[3] or "")
-                            if title_synced
-                            else ""
-                        ),
-                        "title_synced": title_synced,
                     })
 
                 cur.execute(
@@ -3537,6 +3509,331 @@ def redeem_gift_coupon(receiver_user_id: str, raw_code: str):
         ), None
 
 
+def resolve_whisper_target(nickname: str):
+    """@닉네임 귓속말 대상 계정을 정확히 찾습니다.
+
+    닉네임은 현재 DB에서 유일 제약이 없으므로 동일 닉네임이 여러 계정이면
+    잘못된 사람에게 보내지 않도록 전송을 거부합니다.
+    """
+    target = str(nickname).strip()
+    if not target:
+        return None, "whisper_target_missing"
+
+    if not DATABASE_URL:
+        # DB가 없을 때는 현재 접속자 중 정확히 한 명인 경우만 허용합니다.
+        matches = {}
+        for state in clients.values():
+            if not state.get("joined"):
+                continue
+            if str(state.get("nickname", "")).strip() != target:
+                continue
+            user_id = str(state.get("user_id", "")).strip()
+            if user_id:
+                matches[user_id] = str(state.get("nickname", target))
+        if len(matches) == 1:
+            user_id, actual_nickname = next(iter(matches.items()))
+            return {
+                "user_id": user_id,
+                "nickname": actual_nickname,
+            }, ""
+        if len(matches) > 1:
+            return None, "whisper_target_ambiguous"
+        return None, "whisper_target_not_found"
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT user_id, nickname
+                    FROM gardener_accounts
+                    WHERE nickname = %s
+                    ORDER BY updated_at DESC
+                    LIMIT 2
+                    """,
+                    (target,),
+                )
+                rows = cur.fetchall()
+
+        if not rows:
+            return None, "whisper_target_not_found"
+        if len(rows) > 1:
+            return None, "whisper_target_ambiguous"
+
+        return {
+            "user_id": str(rows[0][0]),
+            "nickname": str(rows[0][1]),
+        }, ""
+    except Exception as exc:
+        print(
+            "[귓속말 대상 조회 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return None, "whisper_target_db_error"
+
+
+def persist_chat_message(
+    sender_user_id: str,
+    sender_nickname: str,
+    message: str,
+    whisper_target_user_id: str = "",
+    whisper_target_nickname: str = "",
+):
+    """채팅 한 건을 DB에 저장하고 (message_id, ISO time)을 반환합니다."""
+    global message_sequence
+
+    if DATABASE_URL:
+        try:
+            target_user_id = (
+                str(whisper_target_user_id).strip() or None
+            )
+            target_nickname = (
+                str(whisper_target_nickname).strip() or None
+            )
+            with get_account_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO gardener_chat_messages (
+                            sender_user_id,
+                            sender_nickname,
+                            message,
+                            whisper_target_user_id,
+                            whisper_target_nickname,
+                            created_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, NOW())
+                        RETURNING message_id, created_at
+                        """,
+                        (
+                            str(sender_user_id),
+                            str(sender_nickname),
+                            str(message),
+                            target_user_id,
+                            target_nickname,
+                        ),
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+
+            if row:
+                message_id = int(row[0])
+                created_at = row[1]
+                if created_at is not None:
+                    return message_id, created_at.astimezone(KST).isoformat(
+                        timespec="seconds"
+                    )
+
+        except Exception as exc:
+            print(
+                "[채팅 DB 저장 오류] "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None, ""
+
+    # DB가 없는 로컬 테스트용 fallback
+    message_sequence += 1
+    return message_sequence, now_kst_iso()
+
+
+def get_chat_history_for_user(user_id: str):
+    """공개채팅 + 본인 관련 귓속말만 최근 MAX_HISTORY개 반환합니다."""
+    safe_user_id = str(user_id).strip()
+
+    if DATABASE_URL and safe_user_id:
+        try:
+            with get_account_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            message_id,
+                            sender_user_id,
+                            sender_nickname,
+                            message,
+                            whisper_target_user_id,
+                            whisper_target_nickname,
+                            created_at
+                        FROM gardener_chat_messages
+                        WHERE
+                            whisper_target_user_id IS NULL
+                            OR sender_user_id = %s
+                            OR whisper_target_user_id = %s
+                        ORDER BY message_id DESC
+                        LIMIT %s
+                        """,
+                        (safe_user_id, safe_user_id, MAX_HISTORY),
+                    )
+                    rows = cur.fetchall()
+
+            result = []
+            for row in reversed(rows):
+                target_user_id = (
+                    "" if row[4] is None else str(row[4])
+                )
+                target_nickname = (
+                    "" if row[5] is None else str(row[5])
+                )
+                outgoing = {
+                    "type": "message",
+                    "message_id": int(row[0]),
+                    "user_id": str(row[1]),
+                    "nickname": str(row[2]),
+                    "message": str(row[3]),
+                    "time": row[6].astimezone(KST).isoformat(
+                        timespec="seconds"
+                    ),
+                }
+                if target_user_id:
+                    outgoing["whisper"] = True
+                    outgoing["target_user_id"] = target_user_id
+                    outgoing["target_nickname"] = target_nickname
+                    # 저장된 message는 @닉네임 본문 형식입니다.
+                    prefix = "@" + target_nickname
+                    raw_message = str(row[3])
+                    body = raw_message
+                    if raw_message.startswith(prefix):
+                        body = raw_message[len(prefix):].lstrip()
+                    outgoing["whisper_body"] = body
+                result.append(outgoing)
+            return result
+
+        except Exception as exc:
+            print(
+                "[채팅 DB 불러오기 오류] "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    # 로컬 테스트/DB 장애 시 메모리 history를 개인정보 범위에 맞게 필터링합니다.
+    visible = []
+    for item in list(history):
+        if not bool(item.get("whisper", False)):
+            visible.append(dict(item))
+            continue
+        if (
+            str(item.get("user_id", "")) == safe_user_id
+            or str(item.get("target_user_id", "")) == safe_user_id
+        ):
+            visible.append(dict(item))
+    return visible[-MAX_HISTORY:]
+
+
+def get_latest_public_chat_message():
+    """메인 1줄용 최신 공개채팅 1건."""
+    if DATABASE_URL:
+        try:
+            with get_account_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            message_id,
+                            sender_user_id,
+                            sender_nickname,
+                            message,
+                            created_at
+                        FROM gardener_chat_messages
+                        WHERE whisper_target_user_id IS NULL
+                        ORDER BY message_id DESC
+                        LIMIT 1
+                        """
+                    )
+                    row = cur.fetchone()
+            if row:
+                return {
+                    "type": "message",
+                    "message_id": int(row[0]),
+                    "user_id": str(row[1]),
+                    "nickname": str(row[2]),
+                    "message": str(row[3]),
+                    "time": row[4].astimezone(KST).isoformat(
+                        timespec="seconds"
+                    ),
+                }
+        except Exception as exc:
+            print(
+                "[최신 공개채팅 조회 오류] "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    for item in reversed(history):
+        if not bool(item.get("whisper", False)):
+            return dict(item)
+    return None
+
+
+def find_persisted_chat_message(message_id: int):
+    if DATABASE_URL and int(message_id) >= 0:
+        try:
+            with get_account_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            message_id,
+                            sender_user_id,
+                            sender_nickname,
+                            message,
+                            whisper_target_user_id,
+                            whisper_target_nickname,
+                            created_at
+                        FROM gardener_chat_messages
+                        WHERE message_id = %s
+                        """,
+                        (int(message_id),),
+                    )
+                    row = cur.fetchone()
+            if row:
+                target_user_id = (
+                    "" if row[4] is None else str(row[4])
+                )
+                return {
+                    "type": "message",
+                    "message_id": int(row[0]),
+                    "user_id": str(row[1]),
+                    "nickname": str(row[2]),
+                    "message": str(row[3]),
+                    "whisper": bool(target_user_id),
+                    "target_user_id": target_user_id,
+                    "target_nickname": (
+                        "" if row[5] is None else str(row[5])
+                    ),
+                    "time": row[6].astimezone(KST).isoformat(
+                        timespec="seconds"
+                    ),
+                }
+        except Exception as exc:
+            print(
+                "[채팅 메시지 조회 오류] "
+                f"{type(exc).__name__}: {exc}"
+            )
+    return None
+
+
+async def send_to_user_ids(user_ids, payload: dict):
+    targets = {
+        str(value).strip()
+        for value in user_ids
+        if str(value).strip()
+    }
+    if not targets:
+        return
+
+    sockets = [
+        ws
+        for ws, state in list(clients.items())
+        if state.get("joined")
+        and str(state.get("user_id", "")).strip() in targets
+    ]
+    if not sockets:
+        return
+
+    encoded = json.dumps(payload, ensure_ascii=False)
+    await asyncio.gather(
+        *(ws.send(encoded) for ws in sockets),
+        return_exceptions=True,
+    )
+
 async def send_json(ws, payload: dict):
     await ws.send(json.dumps(payload, ensure_ascii=False))
 
@@ -3586,7 +3883,7 @@ def validate_join(payload: dict):
         return (
             False,
             "level_required",
-            f"정원사 광장은 Lv.{MIN_CHAT_LEVEL}부터 이용할 수 있어요.",
+            f"FlowerGarden 채팅은 Lv.{MIN_CHAT_LEVEL}부터 이용할 수 있어요.",
         )
 
     if not user_id or len(user_id) > 80:
@@ -3623,7 +3920,7 @@ def validate_join(payload: dict):
         return (
             False,
             "temporarily_banned",
-            "광장 이용이 "
+            "채팅 이용이 "
             + format_remaining(banned_remaining)
             + " 동안 제한되어 있어요.",
         )
@@ -3649,7 +3946,7 @@ async def handle_join(ws, payload: dict):
             {
                 "type": "error",
                 "code": "already_joined",
-                "message": "이미 광장에 입장했어요.",
+                "message": "이미 채팅에 연결되어 있어요.",
             },
         )
         return
@@ -3695,7 +3992,8 @@ async def handle_join(ws, payload: dict):
             "nickname": state["nickname"],
             "user_id": state["user_id"],
             "level": state["level"],
-            "history": list(history),
+            "history": get_chat_history_for_user(state["user_id"]),
+            "latest_public": get_latest_public_chat_message(),
             "mute_remaining_seconds": mute_remaining,
             "server_time": now_kst_iso(),
         },
@@ -3714,15 +4012,6 @@ async def handle_account_register(ws, payload: dict):
     user_id = str(payload.get("user_id", "")).strip()
     garden_number = str(payload.get("garden_number", "")).strip()
 
-    # 최신 클라이언트만 title_name을 보냅니다.
-    # 구버전이 접속했을 때 기존 실제 칭호를 '초보 정원사'로 덮어쓰지 않습니다.
-    raw_title_name = payload.get("title_name", None)
-    title_name = None
-    if raw_title_name is not None:
-        parsed_title_name = str(raw_title_name).strip()
-        if parsed_title_name:
-            title_name = parsed_title_name
-
     try:
         level = int(payload.get("level", 0))
     except (TypeError, ValueError):
@@ -3733,7 +4022,6 @@ async def handle_account_register(ws, payload: dict):
         user_id,
         garden_number,
         level,
-        title_name,
     )
 
     await send_json(
@@ -4723,9 +5011,8 @@ async def handle_gift_claim(ws, payload: dict):
     })
 
 
-async def handle_chat_message(ws, payload: dict):
-    global message_sequence
 
+async def handle_chat_message(ws, payload: dict):
     state = clients[ws]
 
     if not state.get("joined"):
@@ -4734,7 +5021,7 @@ async def handle_chat_message(ws, payload: dict):
             {
                 "type": "error",
                 "code": "not_joined",
-                "message": "먼저 광장에 입장해주세요.",
+                "message": "먼저 플라워가든 채팅에 연결해주세요.",
             },
         )
         return
@@ -4763,7 +5050,7 @@ async def handle_chat_message(ws, payload: dict):
                 "action": "mute",
                 "remaining_seconds": mute_remaining,
                 "message": (
-                    "광장 채팅이 "
+                    "채팅이 "
                     + format_remaining(mute_remaining)
                     + " 동안 제한되어 있어요."
                 ),
@@ -4801,25 +5088,139 @@ async def handle_chat_message(ws, payload: dict):
         )
         return
 
-    # 일반 사용자에게는 전송 쿨타임을 두지 않습니다.
-    message_sequence += 1
+    # @닉네임 + 공백 + 내용 형식은 별도 1:1방 없이 같은 채팅창에서 귓속말로 처리합니다.
+    whisper_match = re.match(r"^@([^\s@]+)\s+(.+)$", message, flags=re.DOTALL)
+    if whisper_match:
+        target_name = whisper_match.group(1).strip()
+        whisper_body = whisper_match.group(2).strip()
+
+        if not whisper_body:
+            await send_json(
+                ws,
+                {
+                    "type": "error",
+                    "code": "whisper_empty",
+                    "message": "귓속말 내용을 입력해주세요.",
+                },
+            )
+            return
+
+        target, target_error = resolve_whisper_target(target_name)
+        if target_error:
+            message_by_code = {
+                "whisper_target_not_found": (
+                    "해당 닉네임의 정원사를 찾을 수 없어요."
+                ),
+                "whisper_target_ambiguous": (
+                    "같은 닉네임이 여러 명 있어 귓속말 대상을 정할 수 없어요."
+                ),
+                "whisper_target_db_error": (
+                    "귓속말 대상을 확인하지 못했어요. 잠시 후 다시 시도해주세요."
+                ),
+            }
+            await send_json(
+                ws,
+                {
+                    "type": "error",
+                    "code": target_error,
+                    "message": message_by_code.get(
+                        target_error,
+                        "귓속말 대상을 확인할 수 없어요.",
+                    ),
+                },
+            )
+            return
+
+        target_user_id = str(target["user_id"])
+        target_nickname = str(target["nickname"])
+
+        if target_user_id == str(state["user_id"]):
+            await send_json(
+                ws,
+                {
+                    "type": "error",
+                    "code": "whisper_self",
+                    "message": "자기 자신에게는 귓속말을 보낼 수 없어요.",
+                },
+            )
+            return
+
+        message_id, sent_time = persist_chat_message(
+            state["user_id"],
+            state["nickname"],
+            message,
+            target_user_id,
+            target_nickname,
+        )
+        if message_id is None:
+            await send_json(
+                ws,
+                {
+                    "type": "error",
+                    "code": "chat_save_failed",
+                    "message": "메시지를 저장하지 못했어요. 잠시 후 다시 시도해주세요.",
+                },
+            )
+            return
+
+        outgoing = {
+            "type": "message",
+            "message_id": int(message_id),
+            "user_id": state["user_id"],
+            "nickname": state["nickname"],
+            "message": message,
+            "time": sent_time or now_kst_iso(),
+            "whisper": True,
+            "target_user_id": target_user_id,
+            "target_nickname": target_nickname,
+            "whisper_body": whisper_body,
+        }
+
+        history.append(outgoing)
+        await send_to_user_ids(
+            {str(state["user_id"]), target_user_id},
+            outgoing,
+        )
+
+        print(
+            f"[귓속말] {state['nickname']} -> "
+            f"{target_nickname} #{message_id} {whisper_body}"
+        )
+        return
+
+    # 일반 전체채팅
+    message_id, sent_time = persist_chat_message(
+        state["user_id"],
+        state["nickname"],
+        message,
+    )
+    if message_id is None:
+        await send_json(
+            ws,
+            {
+                "type": "error",
+                "code": "chat_save_failed",
+                "message": "메시지를 저장하지 못했어요. 잠시 후 다시 시도해주세요.",
+            },
+        )
+        return
 
     outgoing = {
         "type": "message",
-        "message_id": message_sequence,
+        "message_id": int(message_id),
         "user_id": state["user_id"],
         "nickname": state["nickname"],
         "message": message,
-        "time": now_kst_iso(),
+        "time": sent_time or now_kst_iso(),
+        "whisper": False,
     }
 
     history.append(outgoing)
-
     await broadcast(outgoing)
 
     print(
         f"[{state['nickname']}] "
-        f"#{message_sequence} {message}"
+        f"#{message_id} {message}"
     )
 
 
@@ -4827,8 +5228,8 @@ def find_history_message(message_id: int):
     for item in reversed(history):
         if int(item.get("message_id", -1)) == message_id:
             return item
-    return None
 
+    return find_persisted_chat_message(message_id)
 
 def prune_report_votes(target_user_id: str):
     votes = report_votes.get(target_user_id)
@@ -4899,7 +5300,7 @@ async def handle_report(ws, payload: dict):
             {
                 "type": "error",
                 "code": "not_joined",
-                "message": "먼저 광장에 입장해주세요.",
+                "message": "먼저 플라워가든 채팅에 연결해주세요.",
             },
         )
         return
@@ -4929,6 +5330,21 @@ async def handle_report(ws, payload: dict):
             },
         )
         return
+
+    if bool(message_item.get("whisper", False)):
+        whisper_sender = str(message_item.get("user_id", ""))
+        whisper_target = str(message_item.get("target_user_id", ""))
+        reporter_user_id = str(state.get("user_id", ""))
+        if reporter_user_id not in {whisper_sender, whisper_target}:
+            await send_json(
+                ws,
+                {
+                    "type": "report_result",
+                    "ok": False,
+                    "message": "신고할 수 없는 메시지예요.",
+                },
+            )
+            return
 
     if target_user_id == state["user_id"]:
         await send_json(
@@ -4995,7 +5411,7 @@ async def handle_report(ws, payload: dict):
             "action": "mute",
             "remaining_seconds": REPORT_AUTO_MUTE_SECONDS,
             "message": (
-                "신고 누적으로 광장 채팅이 "
+                "신고 누적으로 채팅이 "
                 + format_remaining(REPORT_AUTO_MUTE_SECONDS)
                 + " 동안 제한되었습니다."
             ),
@@ -5091,7 +5507,7 @@ async def operator_mute(target: str, minutes: int):
             "action": "mute",
             "remaining_seconds": seconds,
             "message": (
-                "운영자에 의해 광장 채팅이 "
+                "운영자에 의해 채팅이 "
                 + format_remaining(seconds)
                 + " 동안 제한되었습니다."
             ),
