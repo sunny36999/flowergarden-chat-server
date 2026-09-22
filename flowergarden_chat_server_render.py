@@ -5885,7 +5885,8 @@ async def main():
         run_one_time_together_garden_reward_recovery()
 
     print("=" * 60)
-    print(" FlowerGarden 서버 + 함께하는 정원 공동이벤트 2026-09-15")
+    print(" FlowerGarden 서버 2026-09-22 / 메인 전체채팅 + @귓속말 / 함께하는 정원 유지")
+    print("[MAIN_CHAT_20260922] 메인 전체채팅 + @귓속말 + 최근 50개 저장 적용")
     print("=" * 60)
     print(f"Render 서버 포트: {PORT}")
     if account_db_ready:
