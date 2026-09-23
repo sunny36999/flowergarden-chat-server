@@ -1,3 +1,4 @@
+# 2026-09-23 친구목록 칭호연동 복구: 9/22 메인채팅 서버에 9/19 실제 사용칭호 동기화(title_name/title_synced) 재병합 / 기존 메인채팅·귓속말·친구·방명록·함께하는정원·쿠폰 유지
 # 2026-09-22 FlowerGarden 메인 채팅: 최근 50개 DB 유지 / 메인 최신 공개채팅용 history / @닉네임 내용 귓속말(송신자+수신자만 전달·저장) / 기존 신고·제재·친구·방명록·함께하는정원·쿠폰 유지
 # 2026-09-18 쿠폰코드 시스템 1.0: 운영자센터에서 쿠폰 생성/기간설정/중지 + 게임에서 1계정 1회 사용 + 기존 운영자 선물함으로 안전 지급
 # 2026-09-18 운영자 보상 시스템 1.1: 랜덤/지정 씨앗쿠폰 보상 필드 추가 + 웹 운영자센터 연동 준비
@@ -151,6 +152,20 @@ def ensure_account_db() -> bool:
                         level INTEGER NOT NULL DEFAULT 0,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE gardener_accounts
+                    ADD COLUMN IF NOT EXISTS title_name VARCHAR(40)
+                    NOT NULL DEFAULT '초보 정원사'
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE gardener_accounts
+                    ADD COLUMN IF NOT EXISTS title_synced BOOLEAN
+                    NOT NULL DEFAULT FALSE
                     """
                 )
                 cur.execute(
@@ -795,10 +810,17 @@ def register_account_record(
     user_id: str,
     garden_number: str,
     level: int,
+    title_name=None,
 ):
     nickname = str(nickname).strip()
     user_id = str(user_id).strip()
     garden_number = str(garden_number).strip()
+    if title_name is not None:
+        title_name = str(title_name).strip()
+        if not title_name:
+            title_name = None
+        else:
+            title_name = title_name[:40]
 
     if not user_id or len(user_id) > 80:
         return False, "invalid_user_id", "사용자 정보를 확인할 수 없어요."
@@ -866,16 +888,32 @@ def register_account_record(
                     )
 
                 if own_row:
-                    cur.execute(
-                        """
-                        UPDATE gardener_accounts
-                        SET nickname = %s,
-                            level = %s,
-                            updated_at = NOW()
-                        WHERE user_id = %s
-                        """,
-                        (nickname, level, user_id),
-                    )
+                    if title_name is None:
+                        # 구버전/채팅 join처럼 칭호를 보내지 않는 등록은
+                        # 이미 저장된 실제 칭호를 절대 덮어쓰지 않습니다.
+                        cur.execute(
+                            """
+                            UPDATE gardener_accounts
+                            SET nickname = %s,
+                                level = %s,
+                                updated_at = NOW()
+                            WHERE user_id = %s
+                            """,
+                            (nickname, level, user_id),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE gardener_accounts
+                            SET nickname = %s,
+                                level = %s,
+                                title_name = %s,
+                                title_synced = TRUE,
+                                updated_at = NOW()
+                            WHERE user_id = %s
+                            """,
+                            (nickname, level, title_name, user_id),
+                        )
                 else:
                     cur.execute(
                         """
@@ -884,11 +922,20 @@ def register_account_record(
                             nickname,
                             garden_number,
                             level,
+                            title_name,
+                            title_synced,
                             updated_at
                         )
-                        VALUES (%s, %s, %s, %s, NOW())
+                        VALUES (%s, %s, %s, %s, %s, %s, NOW())
                         """,
-                        (user_id, nickname, garden_number, level),
+                        (
+                            user_id,
+                            nickname,
+                            garden_number,
+                            level,
+                            title_name or "초보 정원사",
+                            title_name is not None,
+                        ),
                     )
 
             conn.commit()
@@ -911,7 +958,6 @@ def register_account_record(
             "account_db_error",
             "계정 저장 서버에 잠시 문제가 있어요.",
         )
-
 
 
 def _ensure_together_garden_reward_rows(cur, user_id: str, total_flowers: int, my_contribution: int):
@@ -1325,7 +1371,12 @@ def get_friend_lists(user_id: str):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT a.nickname, a.garden_number, a.level
+                    SELECT
+                        a.nickname,
+                        a.garden_number,
+                        a.level,
+                        a.title_name,
+                        a.title_synced
                     FROM gardener_friendships f
                     JOIN gardener_accounts a
                       ON a.user_id = CASE
@@ -1338,10 +1389,17 @@ def get_friend_lists(user_id: str):
                     (user_id, user_id, user_id),
                 )
                 for row in cur.fetchall():
+                    title_synced = bool(row[4])
                     friends.append({
                         "nickname": str(row[0]),
                         "garden_number": str(row[1]).strip(),
                         "level": int(row[2]),
+                        "title_name": (
+                            str(row[3] or "")
+                            if title_synced
+                            else ""
+                        ),
+                        "title_synced": title_synced,
                     })
 
                 cur.execute(
@@ -1384,7 +1442,6 @@ def get_friend_lists(user_id: str):
     except Exception as exc:
         print(f"[친구 목록 오류] {type(exc).__name__}: {exc}")
         return [], [], [], "friend_db_error"
-
 
 
 def remove_friend(user_id: str, target_garden_number: str):
@@ -4012,6 +4069,15 @@ async def handle_account_register(ws, payload: dict):
     user_id = str(payload.get("user_id", "")).strip()
     garden_number = str(payload.get("garden_number", "")).strip()
 
+    # 최신 클라이언트만 title_name을 보냅니다.
+    # 구버전이 접속했을 때 기존 실제 칭호를 '초보 정원사'로 덮어쓰지 않습니다.
+    raw_title_name = payload.get("title_name", None)
+    title_name = None
+    if raw_title_name is not None:
+        parsed_title_name = str(raw_title_name).strip()
+        if parsed_title_name:
+            title_name = parsed_title_name
+
     try:
         level = int(payload.get("level", 0))
     except (TypeError, ValueError):
@@ -4022,6 +4088,7 @@ async def handle_account_register(ws, payload: dict):
         user_id,
         garden_number,
         level,
+        title_name,
     )
 
     await send_json(
