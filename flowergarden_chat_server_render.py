@@ -1,3 +1,4 @@
+# 2026-09-26 수확물장터 가격 서버검증 보강: 클라이언트 표시 규칙과 동일하게 일반 1.5배/고급 2배/에픽 3배/프리미엄 4배 최대가, 최소가는 창고가 50%로 서버에서 최종 검증하여 범위 밖 등록 차단.
 # 2026-09-26 수확물장터 서버 1.0: 상품등록/조회/검색/취소/비밀번호/동시구매방지/판매기록10건/안전수령함 추가
 # 2026-09-23 친구목록 칭호연동 복구: 9/22 메인채팅 서버에 9/19 실제 사용칭호 동기화(title_name/title_synced) 재병합 / 기존 메인채팅·귓속말·친구·방명록·함께하는정원·쿠폰 유지
 # 2026-09-22 FlowerGarden 메인 채팅: 최근 50개 DB 유지 / 메인 최신 공개채팅용 history / @닉네임 내용 귓속말(송신자+수신자만 전달·저장) / 기존 신고·제재·친구·방명록·함께하는정원·쿠폰 유지
@@ -5531,10 +5532,32 @@ def create_market_listing(user_id: str, nickname: str, payload: dict):
         return False, "invalid_quantity", "한 칸에는 최대 30개까지 등록할 수 있어요.", 0
     if unit_price <= 0 or unit_price > 2_000_000_000:
         return False, "invalid_price", "판매가격을 확인해주세요.", 0
-    if warehouse_price < 0:
-        warehouse_price = 0
+    if warehouse_price <= 0:
+        return False, "invalid_warehouse_price", "수확물 기준가격을 확인해주세요.", 0
     if rarity not in MARKET_ALLOWED_RARITIES:
         rarity = "일반"
+
+    # 클라이언트가 잘못된 가격을 보내더라도 서버에서 최종 차단합니다.
+    market_max_multiplier = 1.5
+    if rarity == "고급":
+        market_max_multiplier = 2.0
+    elif rarity == "에픽":
+        market_max_multiplier = 3.0
+    elif rarity == "프리미엄":
+        market_max_multiplier = 4.0
+
+    market_min_price = max(1, int(warehouse_price * 0.5 + 0.5))
+    market_max_price = max(
+        market_min_price,
+        int(warehouse_price * market_max_multiplier + 0.5),
+    )
+    if unit_price < market_min_price or unit_price > market_max_price:
+        return (
+            False,
+            "price_out_of_range",
+            f"개당 판매가는 {market_min_price}G ~ {market_max_price}G 사이로 등록해주세요.",
+            0,
+        )
     if len(password) > 20:
         return False, "password_too_long", "비밀번호는 20자 이하로 설정해주세요.", 0
     password_hash = market_password_hash(password) if password else None
