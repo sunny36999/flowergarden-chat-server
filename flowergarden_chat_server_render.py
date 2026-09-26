@@ -1,3 +1,4 @@
+# 2026-09-26 수확물장터 서버 1.0: 상품등록/조회/검색/취소/비밀번호/동시구매방지/판매기록10건/안전수령함 추가
 # 2026-09-23 친구목록 칭호연동 복구: 9/22 메인채팅 서버에 9/19 실제 사용칭호 동기화(title_name/title_synced) 재병합 / 기존 메인채팅·귓속말·친구·방명록·함께하는정원·쿠폰 유지
 # 2026-09-22 FlowerGarden 메인 채팅: 최근 50개 DB 유지 / 메인 최신 공개채팅용 history / @닉네임 내용 귓속말(송신자+수신자만 전달·저장) / 기존 신고·제재·친구·방명록·함께하는정원·쿠폰 유지
 # 2026-09-18 쿠폰코드 시스템 1.0: 운영자센터에서 쿠폰 생성/기간설정/중지 + 게임에서 1계정 1회 사용 + 기존 운영자 선물함으로 안전 지급
@@ -20,6 +21,7 @@ import json
 import os
 import re
 import secrets
+import hashlib
 import socket
 import time
 from collections import deque
@@ -537,6 +539,101 @@ def ensure_account_db() -> bool:
                         CHECK (milestone IN (10, 25, 50, 75, 100)),
                         CHECK (status IN ('pending', 'delivered'))
                     )
+                    """
+                )
+                # ==================================================
+                # 🌷 수확물장터 1.0 - 서버 영구저장
+                # ==================================================
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS harvest_market_listings (
+                        listing_id BIGSERIAL PRIMARY KEY,
+                        seller_user_id VARCHAR(80) NOT NULL
+                            REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        seller_nickname VARCHAR(12) NOT NULL,
+                        slot_no INTEGER NOT NULL,
+                        harvest_id VARCHAR(100) NOT NULL,
+                        harvest_name VARCHAR(80) NOT NULL,
+                        rarity VARCHAR(20) NOT NULL DEFAULT '일반',
+                        quantity INTEGER NOT NULL,
+                        unit_price INTEGER NOT NULL,
+                        warehouse_price INTEGER NOT NULL DEFAULT 0,
+                        password_hash VARCHAR(64) NULL,
+                        status VARCHAR(16) NOT NULL DEFAULT 'active',
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        sold_at TIMESTAMPTZ NULL,
+                        CHECK (slot_no BETWEEN 1 AND 12),
+                        CHECK (quantity BETWEEN 1 AND 30),
+                        CHECK (unit_price > 0),
+                        CHECK (warehouse_price >= 0),
+                        CHECK (status IN ('active', 'sold', 'cancelled'))
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_market_active_seller_slot
+                    ON harvest_market_listings (seller_user_id, slot_no)
+                    WHERE status = 'active'
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_market_active_created
+                    ON harvest_market_listings (status, created_at DESC, listing_id DESC)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS harvest_market_sales (
+                        sale_id BIGSERIAL PRIMARY KEY,
+                        listing_id BIGINT NOT NULL REFERENCES harvest_market_listings(listing_id),
+                        seller_user_id VARCHAR(80) NOT NULL REFERENCES gardener_accounts(user_id),
+                        seller_nickname VARCHAR(12) NOT NULL,
+                        buyer_user_id VARCHAR(80) NOT NULL REFERENCES gardener_accounts(user_id),
+                        buyer_nickname VARCHAR(12) NOT NULL,
+                        harvest_id VARCHAR(100) NOT NULL,
+                        harvest_name VARCHAR(80) NOT NULL,
+                        quantity INTEGER NOT NULL,
+                        unit_price INTEGER NOT NULL,
+                        total_price INTEGER NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        CHECK (seller_user_id <> buyer_user_id),
+                        CHECK (quantity > 0),
+                        CHECK (unit_price > 0),
+                        CHECK (total_price > 0)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_market_sales_seller_created
+                    ON harvest_market_sales (seller_user_id, created_at DESC, sale_id DESC)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS harvest_market_deliveries (
+                        delivery_id BIGSERIAL PRIMARY KEY,
+                        sale_id BIGINT NOT NULL REFERENCES harvest_market_sales(sale_id) ON DELETE CASCADE,
+                        receiver_user_id VARCHAR(80) NOT NULL REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        delivery_kind VARCHAR(16) NOT NULL,
+                        harvest_id VARCHAR(100) NULL,
+                        quantity INTEGER NOT NULL DEFAULT 0,
+                        gold INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        claimed_at TIMESTAMPTZ NULL,
+                        UNIQUE (sale_id, receiver_user_id, delivery_kind),
+                        CHECK (delivery_kind IN ('harvest', 'gold')),
+                        CHECK (quantity >= 0),
+                        CHECK (gold >= 0)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_market_delivery_pending
+                    ON harvest_market_deliveries (receiver_user_id, claimed_at, delivery_id)
                     """
                 )
             conn.commit()
@@ -5322,6 +5419,422 @@ def prune_report_votes(target_user_id: str):
     return votes
 
 
+# ==================================================
+# 🌷 수확물장터 1.0
+# - 서버가 상품의 단 한 번 판매를 DB 트랜잭션 + FOR UPDATE로 보장합니다.
+# - 게임 골드/창고는 현재 클라이언트 저장 구조이므로 구매 결과를 delivery로 안전 전달합니다.
+# - delivery는 클라이언트가 실제 반영한 뒤 ack 해야 사라집니다.
+# ==================================================
+MARKET_MAX_SLOT = 12
+MARKET_MAX_QUANTITY = 30
+MARKET_HISTORY_LIMIT = 10
+MARKET_LIST_LIMIT = 200
+MARKET_ALLOWED_RARITIES = {"일반", "고급", "에픽", "프리미엄"}
+
+
+def market_password_hash(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def market_listing_to_dict(row, viewer_user_id: str = "") -> dict:
+    return {
+        "listing_id": int(row[0]),
+        "seller_user_id": str(row[1]),
+        "seller_nickname": str(row[2]),
+        "slot_no": int(row[3]),
+        "harvest_id": str(row[4]),
+        "harvest_name": str(row[5]),
+        "rarity": str(row[6]),
+        "quantity": int(row[7]),
+        "unit_price": int(row[8]),
+        "warehouse_price": int(row[9] or 0),
+        "has_password": bool(row[10]),
+        "is_mine": str(row[1]) == str(viewer_user_id),
+        "created_at": row[11].isoformat() if row[11] else "",
+    }
+
+
+def load_market_listings(viewer_user_id: str, query: str = ""):
+    if not DATABASE_URL:
+        return [], "db_not_configured"
+    q = str(query or "").strip()[:80]
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                params = []
+                where = "WHERE m.status = 'active'"
+                if q:
+                    where += " AND (m.harvest_name ILIKE %s OR m.seller_nickname ILIKE %s)"
+                    like = f"%{q}%"
+                    params.extend([like, like])
+                params.append(MARKET_LIST_LIMIT)
+                cur.execute(
+                    f"""
+                    SELECT m.listing_id, m.seller_user_id, m.seller_nickname,
+                           m.slot_no, m.harvest_id, m.harvest_name, m.rarity,
+                           m.quantity, m.unit_price, m.warehouse_price,
+                           (m.password_hash IS NOT NULL), m.created_at
+                    FROM harvest_market_listings m
+                    {where}
+                    ORDER BY m.created_at DESC, m.listing_id DESC
+                    LIMIT %s
+                    """,
+                    tuple(params),
+                )
+                return [market_listing_to_dict(r, viewer_user_id) for r in cur.fetchall()], ""
+    except Exception as exc:
+        print(f"[장터 목록 오류] {type(exc).__name__}: {exc}")
+        return [], "market_db_error"
+
+
+def load_my_market_listings(user_id: str):
+    if not DATABASE_URL:
+        return [], "db_not_configured"
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT listing_id, seller_user_id, seller_nickname,
+                           slot_no, harvest_id, harvest_name, rarity,
+                           quantity, unit_price, warehouse_price,
+                           (password_hash IS NOT NULL), created_at
+                    FROM harvest_market_listings
+                    WHERE seller_user_id = %s AND status = 'active'
+                    ORDER BY slot_no ASC
+                    """,
+                    (user_id,),
+                )
+                return [market_listing_to_dict(r, user_id) for r in cur.fetchall()], ""
+    except Exception as exc:
+        print(f"[내 장터 오류] {type(exc).__name__}: {exc}")
+        return [], "market_db_error"
+
+
+def create_market_listing(user_id: str, nickname: str, payload: dict):
+    try:
+        slot_no = int(payload.get("slot_no", 0))
+        quantity = int(payload.get("quantity", 0))
+        unit_price = int(payload.get("unit_price", 0))
+        warehouse_price = int(payload.get("warehouse_price", 0))
+    except (TypeError, ValueError):
+        return False, "invalid_number", "수량 또는 가격을 확인해주세요.", 0
+    harvest_id = str(payload.get("harvest_id", "")).strip()[:100]
+    harvest_name = str(payload.get("harvest_name", "")).strip()[:80]
+    rarity = str(payload.get("rarity", "일반")).strip()
+    password = str(payload.get("password", "")).strip()
+    if not (1 <= slot_no <= MARKET_MAX_SLOT):
+        return False, "invalid_slot", "장터칸을 확인해주세요.", 0
+    if not harvest_id or not harvest_name:
+        return False, "invalid_harvest", "등록할 수확물을 확인해주세요.", 0
+    if not (1 <= quantity <= MARKET_MAX_QUANTITY):
+        return False, "invalid_quantity", "한 칸에는 최대 30개까지 등록할 수 있어요.", 0
+    if unit_price <= 0 or unit_price > 2_000_000_000:
+        return False, "invalid_price", "판매가격을 확인해주세요.", 0
+    if warehouse_price < 0:
+        warehouse_price = 0
+    if rarity not in MARKET_ALLOWED_RARITIES:
+        rarity = "일반"
+    if len(password) > 20:
+        return False, "password_too_long", "비밀번호는 20자 이하로 설정해주세요.", 0
+    password_hash = market_password_hash(password) if password else None
+    if not DATABASE_URL:
+        return False, "db_not_configured", "장터 DB가 준비되지 않았어요.", 0
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO harvest_market_listings (
+                        seller_user_id, seller_nickname, slot_no,
+                        harvest_id, harvest_name, rarity, quantity,
+                        unit_price, warehouse_price, password_hash
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING listing_id
+                    """,
+                    (user_id, nickname[:12], slot_no, harvest_id, harvest_name,
+                     rarity, quantity, unit_price, warehouse_price, password_hash),
+                )
+                listing_id = int(cur.fetchone()[0])
+            conn.commit()
+        return True, "ok", "수확물이 장터에 등록되었습니다.", listing_id
+    except psycopg_errors.UniqueViolation:
+        return False, "slot_in_use", "이미 상품이 등록된 장터칸이에요.", 0
+    except Exception as exc:
+        print(f"[장터 등록 오류] {type(exc).__name__}: {exc}")
+        return False, "market_db_error", "상품을 등록하지 못했어요.", 0
+
+
+def cancel_market_listing(user_id: str, listing_id: int):
+    if not DATABASE_URL:
+        return False, "db_not_configured", "장터 DB가 준비되지 않았어요.", {}
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT harvest_id, harvest_name, quantity
+                    FROM harvest_market_listings
+                    WHERE listing_id=%s AND seller_user_id=%s AND status='active'
+                    FOR UPDATE
+                    """,
+                    (listing_id, user_id),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return False, "listing_not_found", "판매 중인 상품을 찾을 수 없어요.", {}
+                cur.execute(
+                    """UPDATE harvest_market_listings
+                       SET status='cancelled' WHERE listing_id=%s""",
+                    (listing_id,),
+                )
+            conn.commit()
+        return True, "ok", "판매를 취소했습니다.", {
+            "harvest_id": str(row[0]), "harvest_name": str(row[1]), "quantity": int(row[2])
+        }
+    except Exception as exc:
+        print(f"[장터 취소 오류] {type(exc).__name__}: {exc}")
+        return False, "market_db_error", "판매를 취소하지 못했어요.", {}
+
+
+def purchase_market_listing(buyer_user_id: str, buyer_nickname: str, listing_id: int, password: str):
+    """동시구매 방지 핵심. 한 listing 행을 FOR UPDATE로 잠근 뒤 sold 처리합니다."""
+    if not DATABASE_URL:
+        return False, "db_not_configured", "장터 DB가 준비되지 않았어요.", {}
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT listing_id, seller_user_id, seller_nickname,
+                           harvest_id, harvest_name, quantity, unit_price,
+                           password_hash, status
+                    FROM harvest_market_listings
+                    WHERE listing_id=%s
+                    FOR UPDATE
+                    """,
+                    (listing_id,),
+                )
+                row = cur.fetchone()
+                if row is None or str(row[8]) != "active":
+                    return False, "already_sold", "이미 판매되었거나 내려간 상품이에요.", {}
+                seller_user_id = str(row[1])
+                if seller_user_id == buyer_user_id:
+                    return False, "cannot_buy_own", "내가 등록한 상품은 구매할 수 없어요.", {}
+                stored_hash = row[7]
+                if stored_hash:
+                    supplied_hash = market_password_hash(str(password or ""))
+                    if not secrets.compare_digest(str(stored_hash), supplied_hash):
+                        return False, "wrong_password", "비밀번호가 맞지 않아요.", {}
+                quantity = int(row[5]); unit_price = int(row[6]); total_price = quantity * unit_price
+                cur.execute(
+                    """
+                    UPDATE harvest_market_listings
+                    SET status='sold', sold_at=NOW()
+                    WHERE listing_id=%s AND status='active'
+                    """,
+                    (listing_id,),
+                )
+                if cur.rowcount != 1:
+                    return False, "already_sold", "다른 정원사가 먼저 구매했어요.", {}
+                cur.execute(
+                    """
+                    INSERT INTO harvest_market_sales (
+                        listing_id, seller_user_id, seller_nickname,
+                        buyer_user_id, buyer_nickname, harvest_id, harvest_name,
+                        quantity, unit_price, total_price
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING sale_id
+                    """,
+                    (listing_id, seller_user_id, str(row[2]), buyer_user_id,
+                     buyer_nickname[:12], str(row[3]), str(row[4]), quantity,
+                     unit_price, total_price),
+                )
+                sale_id = int(cur.fetchone()[0])
+                # 구매자 수확물 / 판매자 골드를 각각 미수령 delivery로 기록합니다.
+                cur.execute(
+                    """
+                    INSERT INTO harvest_market_deliveries
+                    (sale_id, receiver_user_id, delivery_kind, harvest_id, quantity, gold)
+                    VALUES (%s,%s,'harvest',%s,%s,0)
+                    RETURNING delivery_id
+                    """,
+                    (sale_id, buyer_user_id, str(row[3]), quantity),
+                )
+                buyer_delivery_id = int(cur.fetchone()[0])
+                cur.execute(
+                    """
+                    INSERT INTO harvest_market_deliveries
+                    (sale_id, receiver_user_id, delivery_kind, harvest_id, quantity, gold)
+                    VALUES (%s,%s,'gold',NULL,0,%s)
+                    RETURNING delivery_id
+                    """,
+                    (sale_id, seller_user_id, total_price),
+                )
+                seller_delivery_id = int(cur.fetchone()[0])
+            conn.commit()
+        return True, "ok", "구매가 완료되었습니다.", {
+            "sale_id": sale_id, "listing_id": listing_id,
+            "seller_user_id": seller_user_id, "seller_nickname": str(row[2]),
+            "buyer_user_id": buyer_user_id, "buyer_nickname": buyer_nickname[:12],
+            "harvest_id": str(row[3]), "harvest_name": str(row[4]),
+            "quantity": quantity, "unit_price": unit_price, "total_price": total_price,
+            "buyer_delivery_id": buyer_delivery_id, "seller_delivery_id": seller_delivery_id,
+        }
+    except Exception as exc:
+        print(f"[장터 구매 오류] {type(exc).__name__}: {exc}")
+        return False, "market_db_error", "구매 처리 중 오류가 발생했어요.", {}
+
+
+def load_market_sales_history(seller_user_id: str):
+    if not DATABASE_URL:
+        return [], "db_not_configured"
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT sale_id, buyer_nickname, harvest_id, harvest_name,
+                           quantity, unit_price, total_price, created_at
+                    FROM harvest_market_sales
+                    WHERE seller_user_id=%s
+                    ORDER BY created_at DESC, sale_id DESC
+                    LIMIT %s
+                    """,
+                    (seller_user_id, MARKET_HISTORY_LIMIT),
+                )
+                items=[]
+                for r in cur.fetchall():
+                    items.append({
+                        "sale_id": int(r[0]), "buyer_nickname": str(r[1]),
+                        "harvest_id": str(r[2]), "harvest_name": str(r[3]),
+                        "quantity": int(r[4]), "unit_price": int(r[5]),
+                        "total_price": int(r[6]),
+                        "created_at": r[7].isoformat() if r[7] else "",
+                    })
+                return items, ""
+    except Exception as exc:
+        print(f"[장터 기록 오류] {type(exc).__name__}: {exc}")
+        return [], "market_db_error"
+
+
+def load_market_pending_deliveries(user_id: str):
+    if not DATABASE_URL:
+        return [], "db_not_configured"
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT delivery_id, sale_id, delivery_kind,
+                           COALESCE(harvest_id,''), quantity, gold, created_at
+                    FROM harvest_market_deliveries
+                    WHERE receiver_user_id=%s AND claimed_at IS NULL
+                    ORDER BY delivery_id ASC
+                    """,
+                    (user_id,),
+                )
+                items=[]
+                for r in cur.fetchall():
+                    items.append({
+                        "delivery_id": int(r[0]), "sale_id": int(r[1]),
+                        "kind": str(r[2]), "harvest_id": str(r[3]),
+                        "quantity": int(r[4]), "gold": int(r[5]),
+                        "created_at": r[6].isoformat() if r[6] else "",
+                    })
+                return items, ""
+    except Exception as exc:
+        print(f"[장터 수령함 오류] {type(exc).__name__}: {exc}")
+        return [], "market_db_error"
+
+
+def ack_market_delivery(user_id: str, delivery_id: int):
+    if not DATABASE_URL:
+        return False, "db_not_configured"
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE harvest_market_deliveries
+                    SET claimed_at=NOW()
+                    WHERE delivery_id=%s AND receiver_user_id=%s AND claimed_at IS NULL
+                    """,
+                    (delivery_id, user_id),
+                )
+                changed = cur.rowcount == 1
+            conn.commit()
+        return (True, "ok") if changed else (False, "delivery_not_found")
+    except Exception as exc:
+        print(f"[장터 수령확인 오류] {type(exc).__name__}: {exc}")
+        return False, "market_db_error"
+
+
+async def handle_market_list(ws, payload: dict):
+    if not await require_registered_account(ws): return
+    state=clients[ws]; uid=str(state.get("account_user_id", ""))
+    items, code = load_market_listings(uid, str(payload.get("query", "")))
+    await send_json(ws, {"type":"market_list_result","ok":not bool(code),"code":code or "ok","items":items})
+
+
+async def handle_market_my_list(ws, _payload: dict):
+    if not await require_registered_account(ws): return
+    uid=str(clients[ws].get("account_user_id", ""))
+    items, code=load_my_market_listings(uid)
+    await send_json(ws,{"type":"market_my_list_result","ok":not bool(code),"code":code or "ok","items":items})
+
+
+async def handle_market_register(ws, payload: dict):
+    if not await require_registered_account(ws): return
+    state=clients[ws]; uid=str(state.get("account_user_id", "")); nick=str(state.get("nickname", "정원사"))
+    ok,code,msg,lid=create_market_listing(uid,nick,payload)
+    await send_json(ws,{"type":"market_register_result","ok":ok,"code":code,"message":msg,"listing_id":lid,"client_token":str(payload.get("client_token", ""))})
+
+
+async def handle_market_cancel(ws, payload: dict):
+    if not await require_registered_account(ws): return
+    try: lid=int(payload.get("listing_id",0))
+    except (TypeError,ValueError): lid=0
+    uid=str(clients[ws].get("account_user_id", ""))
+    ok,code,msg,item=cancel_market_listing(uid,lid)
+    await send_json(ws,{"type":"market_cancel_result","ok":ok,"code":code,"message":msg,"listing_id":lid,"return_item":item})
+
+
+async def handle_market_purchase(ws, payload: dict):
+    if not await require_registered_account(ws): return
+    try: lid=int(payload.get("listing_id",0))
+    except (TypeError,ValueError): lid=0
+    state=clients[ws]; uid=str(state.get("account_user_id", "")); nick=str(state.get("nickname", "정원사"))
+    ok,code,msg,sale=purchase_market_listing(uid,nick,lid,str(payload.get("password", "")))
+    await send_json(ws,{"type":"market_purchase_result","ok":ok,"code":code,"message":msg,"sale":sale})
+    if ok:
+        seller_uid=str(sale.get("seller_user_id", ""))
+        await notify_account_user_id(seller_uid,{"type":"market_sold_notice","sale":sale,"message":f"{nick}님이 {sale.get('harvest_name','수확물')} {sale.get('quantity',0)}개를 구매했어요."})
+
+
+async def handle_market_history(ws, _payload: dict):
+    if not await require_registered_account(ws): return
+    uid=str(clients[ws].get("account_user_id", ""))
+    items,code=load_market_sales_history(uid)
+    await send_json(ws,{"type":"market_history_result","ok":not bool(code),"code":code or "ok","items":items})
+
+
+async def handle_market_deliveries(ws, _payload: dict):
+    if not await require_registered_account(ws): return
+    uid=str(clients[ws].get("account_user_id", ""))
+    items,code=load_market_pending_deliveries(uid)
+    await send_json(ws,{"type":"market_deliveries_result","ok":not bool(code),"code":code or "ok","items":items})
+
+
+async def handle_market_delivery_ack(ws, payload: dict):
+    if not await require_registered_account(ws): return
+    try: did=int(payload.get("delivery_id",0))
+    except (TypeError,ValueError): did=0
+    uid=str(clients[ws].get("account_user_id", ""))
+    ok,code=ack_market_delivery(uid,did)
+    await send_json(ws,{"type":"market_delivery_ack_result","ok":ok,"code":code,"delivery_id":did})
+
+
 async def notify_account_user_id(user_id: str, payload: dict):
     """광장 입장 여부와 무관하게 계정등록된 현재 연결에 알립니다."""
     targets = []
@@ -5904,6 +6417,30 @@ async def handle_client(ws):
 
             elif msg_type == "gift_claim":
                 await handle_gift_claim(ws, payload)
+
+            elif msg_type == "market_list":
+                await handle_market_list(ws, payload)
+
+            elif msg_type == "market_my_list":
+                await handle_market_my_list(ws, payload)
+
+            elif msg_type == "market_register":
+                await handle_market_register(ws, payload)
+
+            elif msg_type == "market_cancel":
+                await handle_market_cancel(ws, payload)
+
+            elif msg_type == "market_purchase":
+                await handle_market_purchase(ws, payload)
+
+            elif msg_type == "market_history":
+                await handle_market_history(ws, payload)
+
+            elif msg_type == "market_deliveries":
+                await handle_market_deliveries(ws, payload)
+
+            elif msg_type == "market_delivery_ack":
+                await handle_market_delivery_ack(ws, payload)
 
             elif msg_type == "message":
                 await handle_chat_message(ws, payload)
