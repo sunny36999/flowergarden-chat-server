@@ -1,4 +1,3 @@
-# 2026-09-26 수확물장터 가격 서버검증 보강: 클라이언트 표시 규칙과 동일하게 일반 1.5배/고급 2배/에픽 3배/프리미엄 4배 최대가, 최소가는 창고가 50%로 서버에서 최종 검증하여 범위 밖 등록 차단.
 # 2026-09-26 수확물장터 서버 1.0: 상품등록/조회/검색/취소/비밀번호/동시구매방지/판매기록10건/안전수령함 추가
 # 2026-09-23 친구목록 칭호연동 복구: 9/22 메인채팅 서버에 9/19 실제 사용칭호 동기화(title_name/title_synced) 재병합 / 기존 메인채팅·귓속말·친구·방명록·함께하는정원·쿠폰 유지
 # 2026-09-22 FlowerGarden 메인 채팅: 최근 50개 DB 유지 / 메인 최신 공개채팅용 history / @닉네임 내용 귓속말(송신자+수신자만 전달·저장) / 기존 신고·제재·친구·방명록·함께하는정원·쿠폰 유지
@@ -69,6 +68,7 @@ ADMIN_DEFAULT_REWARD = {
     # 씨앗쿠폰은 기본 꾸러미와 별도 보상입니다.
     "random_seed_coupons": 0,
     "choice_seed_coupons": 0,
+    "pet_eggs": 0,
 }
 
 ADMIN_REWARD_MAX_GOLD = 100000000
@@ -298,6 +298,7 @@ def ensure_account_db() -> bool:
                         wait_passes INTEGER NOT NULL DEFAULT 0,
                         random_seed_coupons INTEGER NOT NULL DEFAULT 0,
                         choice_seed_coupons INTEGER NOT NULL DEFAULT 0,
+                        pet_eggs INTEGER NOT NULL DEFAULT 0,
                         note VARCHAR(120) NOT NULL DEFAULT '',
                         recipient_count INTEGER NOT NULL DEFAULT 0,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -309,6 +310,7 @@ def ensure_account_db() -> bool:
                         CHECK (wait_passes >= 0),
                         CHECK (random_seed_coupons >= 0),
                         CHECK (choice_seed_coupons >= 0),
+                        CHECK (pet_eggs >= 0),
                         CHECK (recipient_count >= 0)
                     )
                     """
@@ -324,6 +326,12 @@ def ensure_account_db() -> bool:
                     """
                     ALTER TABLE admin_reward_sends
                     ADD COLUMN IF NOT EXISTS choice_seed_coupons INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE admin_reward_sends
+                    ADD COLUMN IF NOT EXISTS pet_eggs INTEGER NOT NULL DEFAULT 0
                     """
                 )
 
@@ -372,6 +380,7 @@ def ensure_account_db() -> bool:
                         wait_passes INTEGER NOT NULL DEFAULT 0,
                         random_seed_coupons INTEGER NOT NULL DEFAULT 0,
                         choice_seed_coupons INTEGER NOT NULL DEFAULT 0,
+                        pet_eggs INTEGER NOT NULL DEFAULT 0,
                         note VARCHAR(120) NOT NULL DEFAULT '',
                         starts_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         ends_at TIMESTAMPTZ NULL,
@@ -383,8 +392,15 @@ def ensure_account_db() -> bool:
                         CHECK (lottery_tickets >= 0),
                         CHECK (wait_passes >= 0),
                         CHECK (random_seed_coupons >= 0),
-                        CHECK (choice_seed_coupons >= 0)
+                        CHECK (choice_seed_coupons >= 0),
+                        CHECK (pet_eggs >= 0)
                     )
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE gift_coupons
+                    ADD COLUMN IF NOT EXISTS pet_eggs INTEGER NOT NULL DEFAULT 0
                     """
                 )
                 cur.execute(
@@ -2909,6 +2925,9 @@ def normalize_admin_reward_payload(payload: dict):
         "choice_seed_coupons": read_int(
             "choice_seed_coupons", ADMIN_REWARD_MAX_ITEM_COUNT
         ),
+        "pet_eggs": read_int(
+            "pet_eggs", ADMIN_REWARD_MAX_ITEM_COUNT
+        ),
     }
     return rewards
 
@@ -3052,6 +3071,7 @@ def create_admin_reward_send(
                         wait_passes,
                         random_seed_coupons,
                         choice_seed_coupons,
+                        pet_eggs,
                         note,
                         recipient_count,
                         created_at
@@ -3059,7 +3079,7 @@ def create_admin_reward_send(
                     VALUES (
                         %s, %s, %s, %s,
                         %s, %s, %s, %s, %s,
-                        %s, %s,
+                        %s, %s, %s,
                         %s, %s, NOW()
                     )
                     RETURNING send_id
@@ -3076,6 +3096,7 @@ def create_admin_reward_send(
                         int(rewards["wait_passes"]),
                         int(rewards["random_seed_coupons"]),
                         int(rewards["choice_seed_coupons"]),
+                        int(rewards["pet_eggs"]),
                         note,
                         len(receiver_ids),
                     ),
@@ -3144,6 +3165,7 @@ def load_admin_reward_history(limit: int = 100):
                         s.wait_passes,
                         s.random_seed_coupons,
                         s.choice_seed_coupons,
+                        s.pet_eggs,
                         s.note,
                         s.recipient_count,
                         s.created_at,
@@ -3161,7 +3183,7 @@ def load_admin_reward_history(limit: int = 100):
                 )
                 items = []
                 for row in cur.fetchall():
-                    created_at = row[13]
+                    created_at = row[14]
                     items.append({
                         "send_id": int(row[0]),
                         "target_kind": str(row[1]),
@@ -3178,10 +3200,11 @@ def load_admin_reward_history(limit: int = 100):
                         "wait_passes": int(row[8]),
                         "random_seed_coupons": int(row[9]),
                         "choice_seed_coupons": int(row[10]),
-                        "note": str(row[11]),
-                        "recipient_count": int(row[12]),
+                        "pet_eggs": int(row[11]),
+                        "note": str(row[12]),
+                        "recipient_count": int(row[13]),
                         "time_text": format_guestbook_time(created_at),
-                        "delivered_count": int(row[14] or 0),
+                        "delivered_count": int(row[15] or 0),
                     })
         return items, ""
     except Exception as exc:
@@ -3209,6 +3232,7 @@ def load_operator_reward_inbox(receiver_user_id: str):
                         s.wait_passes,
                         s.random_seed_coupons,
                         s.choice_seed_coupons,
+                        s.pet_eggs,
                         s.note,
                         s.created_at
                     FROM admin_reward_deliveries d
@@ -3232,8 +3256,9 @@ def load_operator_reward_inbox(receiver_user_id: str):
                         "wait_passes": int(row[6]),
                         "random_seed_coupons": int(row[7]),
                         "choice_seed_coupons": int(row[8]),
-                        "note": str(row[9]),
-                        "time_text": format_guestbook_time(row[10]),
+                        "pet_eggs": int(row[9]),
+                        "note": str(row[10]),
+                        "time_text": format_guestbook_time(row[11]),
                     })
         return rewards, ""
     except Exception as exc:
@@ -3351,13 +3376,14 @@ def create_admin_coupon(
                         wait_passes,
                         random_seed_coupons,
                         choice_seed_coupons,
+                        pet_eggs,
                         note,
                         starts_at,
                         ends_at,
                         enabled,
                         created_at
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, TRUE, NOW()
                     )
                     RETURNING coupon_id
@@ -3372,6 +3398,7 @@ def create_admin_coupon(
                         int(rewards.get("wait_passes", 0)),
                         int(rewards.get("random_seed_coupons", 0)),
                         int(rewards.get("choice_seed_coupons", 0)),
+                        int(rewards.get("pet_eggs", 0)),
                         note,
                         start_dt,
                         end_dt,
@@ -3405,6 +3432,7 @@ def list_admin_coupons(limit: int = 100):
                         c.wait_passes,
                         c.random_seed_coupons,
                         c.choice_seed_coupons,
+                        c.pet_eggs,
                         c.note,
                         c.starts_at,
                         c.ends_at,
@@ -3425,9 +3453,9 @@ def list_admin_coupons(limit: int = 100):
         now_utc = datetime.now(timezone.utc)
         items = []
         for row in rows:
-            start_dt = row[11]
-            end_dt = row[12]
-            enabled = bool(row[13])
+            start_dt = row[12]
+            end_dt = row[13]
+            enabled = bool(row[14])
             if not enabled:
                 status = "stopped"
             elif start_dt is not None and now_utc < start_dt:
@@ -3448,16 +3476,17 @@ def list_admin_coupons(limit: int = 100):
                 "wait_passes": int(row[7]),
                 "random_seed_coupons": int(row[8]),
                 "choice_seed_coupons": int(row[9]),
-                "note": str(row[10]),
-                "starts_at": row[11].isoformat() if row[11] else "",
-                "ends_at": row[12].isoformat() if row[12] else "",
-                "starts_at_text": format_coupon_kst(row[11]),
-                "ends_at_text": format_coupon_kst(row[12]),
+                "pet_eggs": int(row[10]),
+                "note": str(row[11]),
+                "starts_at": row[12].isoformat() if row[12] else "",
+                "ends_at": row[13].isoformat() if row[13] else "",
+                "starts_at_text": format_coupon_kst(row[12]),
+                "ends_at_text": format_coupon_kst(row[13]),
                 "enabled": enabled,
                 "status": status,
-                "created_at": row[14].isoformat() if row[14] else "",
-                "created_at_text": format_coupon_kst(row[14]),
-                "claim_count": int(row[15]),
+                "created_at": row[15].isoformat() if row[15] else "",
+                "created_at_text": format_coupon_kst(row[15]),
+                "claim_count": int(row[16]),
             })
         return items, ""
     except Exception as exc:
@@ -3512,6 +3541,7 @@ def redeem_gift_coupon(receiver_user_id: str, raw_code: str):
                         wait_passes,
                         random_seed_coupons,
                         choice_seed_coupons,
+                        pet_eggs,
                         note,
                         starts_at,
                         ends_at,
@@ -3529,9 +3559,9 @@ def redeem_gift_coupon(receiver_user_id: str, raw_code: str):
 
                 coupon_id = int(coupon[0])
                 now_utc = datetime.now(timezone.utc)
-                starts_at = coupon[11]
-                ends_at = coupon[12]
-                enabled = bool(coupon[13])
+                starts_at = coupon[12]
+                ends_at = coupon[13]
+                enabled = bool(coupon[14])
 
                 if not enabled:
                     return False, "coupon_stopped", "사용이 종료된 쿠폰이에요.", None
@@ -3578,6 +3608,7 @@ def redeem_gift_coupon(receiver_user_id: str, raw_code: str):
                     "wait_passes": int(coupon[7]),
                     "random_seed_coupons": int(coupon[8]),
                     "choice_seed_coupons": int(coupon[9]),
+                    "pet_eggs": int(coupon[10]),
                 }
 
                 # 쿠폰 보상도 기존 운영자 선물함 delivery로 만들어
@@ -3596,12 +3627,13 @@ def redeem_gift_coupon(receiver_user_id: str, raw_code: str):
                         wait_passes,
                         random_seed_coupons,
                         choice_seed_coupons,
+                        pet_eggs,
                         note,
                         recipient_count,
                         created_at
                     ) VALUES (
                         'user', %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, 1, NOW()
                     )
                     RETURNING send_id
@@ -3617,7 +3649,8 @@ def redeem_gift_coupon(receiver_user_id: str, raw_code: str):
                         rewards["wait_passes"],
                         rewards["random_seed_coupons"],
                         rewards["choice_seed_coupons"],
-                        str(coupon[10] or "")[:120],
+                        rewards["pet_eggs"],
+                        str(coupon[11] or "")[:120],
                     ),
                 )
                 send_id = int(cur.fetchone()[0])
@@ -5532,32 +5565,10 @@ def create_market_listing(user_id: str, nickname: str, payload: dict):
         return False, "invalid_quantity", "한 칸에는 최대 30개까지 등록할 수 있어요.", 0
     if unit_price <= 0 or unit_price > 2_000_000_000:
         return False, "invalid_price", "판매가격을 확인해주세요.", 0
-    if warehouse_price <= 0:
-        return False, "invalid_warehouse_price", "수확물 기준가격을 확인해주세요.", 0
+    if warehouse_price < 0:
+        warehouse_price = 0
     if rarity not in MARKET_ALLOWED_RARITIES:
         rarity = "일반"
-
-    # 클라이언트가 잘못된 가격을 보내더라도 서버에서 최종 차단합니다.
-    market_max_multiplier = 1.5
-    if rarity == "고급":
-        market_max_multiplier = 2.0
-    elif rarity == "에픽":
-        market_max_multiplier = 3.0
-    elif rarity == "프리미엄":
-        market_max_multiplier = 4.0
-
-    market_min_price = max(1, int(warehouse_price * 0.5 + 0.5))
-    market_max_price = max(
-        market_min_price,
-        int(warehouse_price * market_max_multiplier + 0.5),
-    )
-    if unit_price < market_min_price or unit_price > market_max_price:
-        return (
-            False,
-            "price_out_of_range",
-            f"개당 판매가는 {market_min_price}G ~ {market_max_price}G 사이로 등록해주세요.",
-            0,
-        )
     if len(password) > 20:
         return False, "password_too_long", "비밀번호는 20자 이하로 설정해주세요.", 0
     password_hash = market_password_hash(password) if password else None
