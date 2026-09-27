@@ -114,6 +114,7 @@
         <div class="reward-box"><label>⏩ 대기패스권</label><input id="wait_passes" type="number" min="0" value="10"></div>
         <div class="reward-box"><label>🎲 랜덤 씨앗쿠폰</label><input id="random_seed_coupons" type="number" min="0" value="0"></div>
         <div class="reward-box"><label>🌱 지정 씨앗쿠폰</label><input id="choice_seed_coupons" type="number" min="0" value="0"></div>
+        <div class="reward-box"><label>🥚 펫 알</label><input id="pet_eggs" type="number" min="0" value="0"></div>
       </div>
 
       <div style="margin-top:12px"><label>메모 (선택)</label><textarea id="note" maxlength="120" placeholder="예: 9/18 테스터 감사선물"></textarea></div>
@@ -139,7 +140,7 @@
       <div class="row" style="margin-top:14px">
         <div class="grow">
           <label>쿠폰 코드</label>
-          <input id="couponCode" maxlength="32" placeholder="예: 7K3M9P">
+          <input id="couponCode" maxlength="32" placeholder="예: FLOWER-THANKS">
         </div>
         <button class="plain" id="couponGenerateBtn">자동 생성</button>
         <div class="grow">
@@ -180,6 +181,7 @@
         <div class="reward-box"><label>⏩ 대기패스권</label><input id="coupon_wait_passes" type="number" min="0" value="0"></div>
         <div class="reward-box"><label>🎲 랜덤 씨앗쿠폰</label><input id="coupon_random_seed_coupons" type="number" min="0" value="0"></div>
         <div class="reward-box"><label>🌱 지정 씨앗쿠폰</label><input id="coupon_choice_seed_coupons" type="number" min="0" value="0"></div>
+        <div class="reward-box"><label>🥚 펫 알</label><input id="coupon_pet_eggs" type="number" min="0" value="0"></div>
       </div>
 
       <div style="margin-top:12px">
@@ -234,7 +236,7 @@ let loggedIn = false;
 let selectedUser = null;
 
 const $ = id => document.getElementById(id);
-const rewardKeys = ["king_water_drops","water_drops","gold","lottery_tickets","wait_passes","random_seed_coupons","choice_seed_coupons"];
+const rewardKeys = ["king_water_drops","water_drops","gold","lottery_tickets","wait_passes","random_seed_coupons","choice_seed_coupons","pet_eggs"];
 
 function setConnection(ok, text){
   $("connDot").className = "dot " + (ok ? "ok" : "bad");
@@ -353,7 +355,7 @@ function rewardPayload(){
   return o;
 }
 function rewardSummary(r){
-  const names={king_water_drops:"왕방울",water_drops:"물방울",gold:"G",lottery_tickets:"복권",wait_passes:"대기패스",random_seed_coupons:"랜덤씨앗쿠폰",choice_seed_coupons:"지정씨앗쿠폰"};
+  const names={king_water_drops:"왕방울",water_drops:"물방울",gold:"G",lottery_tickets:"복권",wait_passes:"대기패스",random_seed_coupons:"랜덤씨앗쿠폰",choice_seed_coupons:"지정씨앗쿠폰",pet_eggs:"펫 알"};
   return rewardKeys.filter(k=>Number(r[k]||0)>0).map(k=>k==="gold"?`${Number(r[k]).toLocaleString()}G`:`${names[k]} ${r[k]}`).join(" · ");
 }
 function sendReward(){
@@ -374,7 +376,7 @@ function sendReward(){
   });
 }
 function setPreset(){
-  const vals={king_water_drops:50,water_drops:100,gold:10000,lottery_tickets:10,wait_passes:10,random_seed_coupons:0,choice_seed_coupons:0};
+  const vals={king_water_drops:50,water_drops:100,gold:10000,lottery_tickets:10,wait_passes:10,random_seed_coupons:0,choice_seed_coupons:0,pet_eggs:0};
   rewardKeys.forEach(k=>$(k).value=vals[k]);
 }
 function clearRewards(){ rewardKeys.forEach(k=>$(k).value=0); }
@@ -385,7 +387,7 @@ function couponRewardPayload(){
   return o;
 }
 function setCouponPreset(){
-  const vals={king_water_drops:50,water_drops:100,gold:10000,lottery_tickets:10,wait_passes:10,random_seed_coupons:0,choice_seed_coupons:0};
+  const vals={king_water_drops:50,water_drops:100,gold:10000,lottery_tickets:10,wait_passes:10,random_seed_coupons:0,choice_seed_coupons:0,pet_eggs:0};
   rewardKeys.forEach(k=>$("coupon_"+k).value=vals[k]);
 }
 function clearCouponRewards(){ rewardKeys.forEach(k=>$("coupon_"+k).value=0); }
@@ -393,12 +395,14 @@ function normalizeCouponCode(v){
   return String(v||"").trim().toUpperCase().replace(/\s+/g,"");
 }
 function generateCouponCode(){
-  // 입력하기 쉬운 6자리 쿠폰 코드.
-  // O/0, I/1처럼 헷갈리기 쉬운 문자는 제외합니다.
+  const d=new Date();
+  const y=d.getFullYear();
+  const m=String(d.getMonth()+1).padStart(2,"0");
+  const day=String(d.getDate()).padStart(2,"0");
   const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let code="";
-  for(let i=0;i<6;i++) code+=chars[Math.floor(Math.random()*chars.length)];
-  $("couponCode").value=code;
+  let tail="";
+  for(let i=0;i<5;i++) tail+=chars[Math.floor(Math.random()*chars.length)];
+  $("couponCode").value=`FLOWER-${y}${m}${day}-${tail}`;
 }
 function updateCouponPeriodUI(){
   const custom=$("couponPeriod").value==="custom";
