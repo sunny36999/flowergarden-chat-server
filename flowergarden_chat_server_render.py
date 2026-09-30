@@ -1,3 +1,4 @@
+# 2026-10-01 긴급수정: 함께하는 정원 회차 event_id 동적 분리(매월 1일/16일) + 11월 기여도 0송이 오류 수정
 # 2026-09-26 수확물장터 서버 1.0: 상품등록/조회/검색/취소/비밀번호/동시구매방지/판매기록10건/안전수령함 추가
 # 2026-09-23 친구목록 칭호연동 복구: 9/22 메인채팅 서버에 9/19 실제 사용칭호 동기화(title_name/title_synced) 재병합 / 기존 메인채팅·귓속말·친구·방명록·함께하는정원·쿠폰 유지
 # 2026-09-22 FlowerGarden 메인 채팅: 최근 50개 DB 유지 / 메인 최신 공개채팅용 history / @닉네임 내용 귓속말(송신자+수신자만 전달·저장) / 기존 신고·제재·친구·방명록·함께하는정원·쿠폰 유지
@@ -81,6 +82,7 @@ TOGETHER_GARDEN_EVENT_ID = "first_tree_20260915"
 TOGETHER_GARDEN_TARGET_FLOWERS = 100000
 TOGETHER_GARDEN_REWARD_MILESTONES = (10, 25, 50, 75, 100)
 TOGETHER_GARDEN_MAX_HARVEST_PER_ACTION = 100
+TOGETHER_GARDEN_ALLOWED_THEME_IDS = {"puzzle", "decor", "bouquet", "castle", "tree"}
 TRANSFER_CODE_LENGTH = 8
 TRANSFER_BACKUP_RETENTION_DAYS = 45
 TRANSFER_SAVE_MAX_BYTES = 1500 * 1024
@@ -1074,8 +1076,56 @@ def register_account_record(
         )
 
 
-def _ensure_together_garden_reward_rows(cur, user_id: str, total_flowers: int, my_contribution: int):
-    # 공동 달성 보상은 개인 기여량과 관계없이 등록 정원사에게 지급합니다.
+def resolve_together_garden_event_id(raw_event_id) -> str:
+    """최신 클라이언트의 회차 ID를 검증합니다. 빈 값은 구버전 호환용 legacy 회차로 처리합니다."""
+    event_id = str(raw_event_id or "").strip()
+    if not event_id:
+        return TOGETHER_GARDEN_EVENT_ID
+    if event_id == TOGETHER_GARDEN_EVENT_ID:
+        return event_id
+
+    match = re.fullmatch(
+        r"together_(puzzle|decor|bouquet|castle|tree)_(\d{8})",
+        event_id,
+    )
+    if not match:
+        return ""
+
+    theme_id = match.group(1)
+    if theme_id not in TOGETHER_GARDEN_ALLOWED_THEME_IDS:
+        return ""
+
+    date_text = match.group(2)
+    try:
+        event_date = datetime.strptime(date_text, "%Y%m%d")
+    except ValueError:
+        return ""
+    if event_date.day not in (1, 16):
+        return ""
+
+    return event_id
+
+
+def ensure_together_garden_event_row(cur, event_id: str) -> None:
+    cur.execute(
+        """
+        INSERT INTO together_garden_events (
+            event_id, total_flowers, target_flowers, updated_at
+        ) VALUES (%s, 0, %s, NOW())
+        ON CONFLICT (event_id) DO UPDATE
+        SET target_flowers = EXCLUDED.target_flowers
+        """,
+        (event_id, TOGETHER_GARDEN_TARGET_FLOWERS),
+    )
+
+
+def _ensure_together_garden_reward_rows(
+    cur,
+    user_id: str,
+    total_flowers: int,
+    my_contribution: int,
+    event_id: str = TOGETHER_GARDEN_EVENT_ID,
+):
     _ = my_contribution
 
     for milestone in TOGETHER_GARDEN_REWARD_MILESTONES:
@@ -1089,24 +1139,30 @@ def _ensure_together_garden_reward_rows(cur, user_id: str, total_flowers: int, m
             ) VALUES (%s, %s, %s, 'pending', NOW())
             ON CONFLICT (event_id, user_id, milestone) DO NOTHING
             """,
-            (TOGETHER_GARDEN_EVENT_ID, user_id, milestone),
+            (event_id, user_id, milestone),
         )
 
 
-def get_together_garden_state(user_id: str):
+def get_together_garden_state(user_id: str, raw_event_id=""):
     if not DATABASE_URL:
         return None, "account_db_unavailable"
+
+    event_id = resolve_together_garden_event_id(raw_event_id)
+    if not event_id:
+        return None, "invalid_event_id"
 
     try:
         with get_account_db_connection() as conn:
             with conn.cursor() as cur:
+                ensure_together_garden_event_row(cur, event_id)
+
                 cur.execute(
                     """
                     SELECT total_flowers, target_flowers
                     FROM together_garden_events
                     WHERE event_id = %s
                     """,
-                    (TOGETHER_GARDEN_EVENT_ID,),
+                    (event_id,),
                 )
                 row = cur.fetchone()
                 if not row:
@@ -1121,7 +1177,7 @@ def get_together_garden_state(user_id: str):
                     FROM together_garden_contributions
                     WHERE event_id = %s AND user_id = %s
                     """,
-                    (TOGETHER_GARDEN_EVENT_ID, user_id),
+                    (event_id, user_id),
                 )
                 contribution_row = cur.fetchone()
                 my_contribution = (
@@ -1135,6 +1191,7 @@ def get_together_garden_state(user_id: str):
                     user_id,
                     total_flowers,
                     my_contribution,
+                    event_id,
                 )
 
                 cur.execute(
@@ -1146,13 +1203,13 @@ def get_together_garden_state(user_id: str):
                       AND status = 'pending'
                     ORDER BY milestone ASC
                     """,
-                    (TOGETHER_GARDEN_EVENT_ID, user_id),
+                    (event_id, user_id),
                 )
                 pending_rewards = [int(item[0]) for item in cur.fetchall()]
             conn.commit()
 
         return {
-            "event_id": TOGETHER_GARDEN_EVENT_ID,
+            "event_id": event_id,
             "total_flowers": min(total_flowers, target_flowers),
             "target_flowers": target_flowers,
             "my_contribution": my_contribution,
@@ -1167,7 +1224,12 @@ def get_together_garden_state(user_id: str):
         return None, "together_garden_db_error"
 
 
-def add_together_garden_harvest(user_id: str, action_id: str, flower_count: int):
+def add_together_garden_harvest(
+    user_id: str,
+    action_id: str,
+    flower_count: int,
+    raw_event_id="",
+):
     action_id = str(action_id).strip()
     if not action_id or len(action_id) > 180:
         return None, "invalid_action_id"
@@ -1180,6 +1242,10 @@ def add_together_garden_harvest(user_id: str, action_id: str, flower_count: int)
     if flower_count <= 0 or flower_count > TOGETHER_GARDEN_MAX_HARVEST_PER_ACTION:
         return None, "invalid_flower_count"
 
+    event_id = resolve_together_garden_event_id(raw_event_id)
+    if not event_id:
+        return None, "invalid_event_id"
+
     if not DATABASE_URL:
         return None, "account_db_unavailable"
 
@@ -1189,6 +1255,8 @@ def add_together_garden_harvest(user_id: str, action_id: str, flower_count: int)
 
         with get_account_db_connection() as conn:
             with conn.cursor() as cur:
+                ensure_together_garden_event_row(cur, event_id)
+
                 cur.execute(
                     """
                     SELECT accepted_count
@@ -1197,7 +1265,7 @@ def add_together_garden_harvest(user_id: str, action_id: str, flower_count: int)
                       AND user_id = %s
                       AND action_id = %s
                     """,
-                    (TOGETHER_GARDEN_EVENT_ID, user_id, action_id),
+                    (event_id, user_id, action_id),
                 )
                 existing = cur.fetchone()
 
@@ -1212,7 +1280,7 @@ def add_together_garden_harvest(user_id: str, action_id: str, flower_count: int)
                         WHERE event_id = %s
                         FOR UPDATE
                         """,
-                        (TOGETHER_GARDEN_EVENT_ID,),
+                        (event_id,),
                     )
                     event_row = cur.fetchone()
                     if not event_row:
@@ -1235,7 +1303,7 @@ def add_together_garden_harvest(user_id: str, action_id: str, flower_count: int)
                         ) VALUES (%s, %s, %s, %s, %s, NOW())
                         """,
                         (
-                            TOGETHER_GARDEN_EVENT_ID,
+                            event_id,
                             user_id,
                             action_id,
                             flower_count,
@@ -1251,7 +1319,7 @@ def add_together_garden_harvest(user_id: str, action_id: str, flower_count: int)
                                 updated_at = NOW()
                             WHERE event_id = %s
                             """,
-                            (accepted_count, TOGETHER_GARDEN_EVENT_ID),
+                            (accepted_count, event_id),
                         )
                         cur.execute(
                             """
@@ -1262,11 +1330,7 @@ def add_together_garden_harvest(user_id: str, action_id: str, flower_count: int)
                             SET flower_count = together_garden_contributions.flower_count + EXCLUDED.flower_count,
                                 updated_at = NOW()
                             """,
-                            (
-                                TOGETHER_GARDEN_EVENT_ID,
-                                user_id,
-                                accepted_count,
-                            ),
+                            (event_id, user_id, accepted_count),
                         )
 
                 cur.execute(
@@ -1275,7 +1339,7 @@ def add_together_garden_harvest(user_id: str, action_id: str, flower_count: int)
                     FROM together_garden_events
                     WHERE event_id = %s
                     """,
-                    (TOGETHER_GARDEN_EVENT_ID,),
+                    (event_id,),
                 )
                 total_row = cur.fetchone()
                 total_flowers = max(0, int(total_row[0]))
@@ -1287,7 +1351,7 @@ def add_together_garden_harvest(user_id: str, action_id: str, flower_count: int)
                     FROM together_garden_contributions
                     WHERE event_id = %s AND user_id = %s
                     """,
-                    (TOGETHER_GARDEN_EVENT_ID, user_id),
+                    (event_id, user_id),
                 )
                 contribution_row = cur.fetchone()
                 my_contribution = (
@@ -1301,6 +1365,7 @@ def add_together_garden_harvest(user_id: str, action_id: str, flower_count: int)
                     user_id,
                     total_flowers,
                     my_contribution,
+                    event_id,
                 )
 
                 cur.execute(
@@ -1312,13 +1377,13 @@ def add_together_garden_harvest(user_id: str, action_id: str, flower_count: int)
                       AND status = 'pending'
                     ORDER BY milestone ASC
                     """,
-                    (TOGETHER_GARDEN_EVENT_ID, user_id),
+                    (event_id, user_id),
                 )
                 pending_rewards = [int(item[0]) for item in cur.fetchall()]
             conn.commit()
 
         return {
-            "event_id": TOGETHER_GARDEN_EVENT_ID,
+            "event_id": event_id,
             "action_id": action_id,
             "duplicate": duplicate,
             "accepted_count": accepted_count,
@@ -1336,7 +1401,11 @@ def add_together_garden_harvest(user_id: str, action_id: str, flower_count: int)
         return None, "together_garden_db_error"
 
 
-def acknowledge_together_garden_reward(user_id: str, milestone: int):
+def acknowledge_together_garden_reward(
+    user_id: str,
+    milestone: int,
+    raw_event_id="",
+):
     try:
         milestone = int(milestone)
     except (TypeError, ValueError):
@@ -1344,6 +1413,11 @@ def acknowledge_together_garden_reward(user_id: str, milestone: int):
 
     if milestone not in TOGETHER_GARDEN_REWARD_MILESTONES:
         return False, "invalid_milestone"
+
+    event_id = resolve_together_garden_event_id(raw_event_id)
+    if not event_id:
+        return False, "invalid_event_id"
+
     if not DATABASE_URL:
         return False, "account_db_unavailable"
 
@@ -1360,7 +1434,7 @@ def acknowledge_together_garden_reward(user_id: str, milestone: int):
                       AND milestone = %s
                       AND status = 'pending'
                     """,
-                    (TOGETHER_GARDEN_EVENT_ID, user_id, milestone),
+                    (event_id, user_id, milestone),
                 )
                 updated = cur.rowcount > 0
 
@@ -1373,7 +1447,7 @@ def acknowledge_together_garden_reward(user_id: str, milestone: int):
                           AND user_id = %s
                           AND milestone = %s
                         """,
-                        (TOGETHER_GARDEN_EVENT_ID, user_id, milestone),
+                        (event_id, user_id, milestone),
                     )
                     row = cur.fetchone()
                     if row and str(row[0]) == "delivered":
@@ -4930,13 +5004,14 @@ async def handle_garden_steal(ws, payload: dict):
 
 
 
-async def handle_together_garden_sync(ws, _payload: dict):
+async def handle_together_garden_sync(ws, payload: dict):
     if not await require_registered_account(ws):
         return
 
     state = clients[ws]
     data, error_code = get_together_garden_state(
-        str(state.get("account_user_id", ""))
+        str(state.get("account_user_id", "")),
+        payload.get("event_id", ""),
     )
     if error_code or not data:
         await send_json(ws, {
@@ -4963,6 +5038,7 @@ async def handle_together_garden_harvest(ws, payload: dict):
         str(state.get("account_user_id", "")),
         str(payload.get("action_id", "")),
         payload.get("flower_count", 0),
+        payload.get("event_id", ""),
     )
     if error_code or not data:
         await send_json(ws, {
@@ -4990,6 +5066,7 @@ async def handle_together_garden_reward_ack(ws, payload: dict):
     ok, code = acknowledge_together_garden_reward(
         str(state.get("account_user_id", "")),
         milestone,
+        payload.get("event_id", ""),
     )
     await send_json(ws, {
         "type": "together_garden_reward_ack_result",
