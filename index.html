@@ -140,7 +140,7 @@
       <div class="row" style="margin-top:14px">
         <div class="grow">
           <label>쿠폰 코드</label>
-          <input id="couponCode" maxlength="32" placeholder="예: FLOWER-THANKS">
+          <input id="couponCode" maxlength="32" placeholder="예: A7K3P9">
         </div>
         <button class="plain" id="couponGenerateBtn">자동 생성</button>
         <div class="grow">
@@ -395,14 +395,10 @@ function normalizeCouponCode(v){
   return String(v||"").trim().toUpperCase().replace(/\s+/g,"");
 }
 function generateCouponCode(){
-  const d=new Date();
-  const y=d.getFullYear();
-  const m=String(d.getMonth()+1).padStart(2,"0");
-  const day=String(d.getDate()).padStart(2,"0");
   const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let tail="";
-  for(let i=0;i<5;i++) tail+=chars[Math.floor(Math.random()*chars.length)];
-  $("couponCode").value=`FLOWER-${y}${m}${day}-${tail}`;
+  let code="";
+  for(let i=0;i<6;i++) code+=chars[Math.floor(Math.random()*chars.length)];
+  $("couponCode").value=code;
 }
 function updateCouponPeriodUI(){
   const custom=$("couponPeriod").value==="custom";
