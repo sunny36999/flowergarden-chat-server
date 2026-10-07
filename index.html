@@ -48,11 +48,15 @@
     .badge.scheduled{background:#e8efff;color:#435f96}
     .badge.expired,.badge.stopped{background:#f5e5e2;color:#934b45}
     .coupon-actions{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}
+    .beta-row{display:grid;grid-template-columns:1.2fr .9fr .55fr 1fr auto;gap:9px;align-items:center;padding:12px 3px;border-bottom:1px solid #eee7da}
+    .beta-row:last-child{border-bottom:0}
+    .beta-summary{padding:10px 0 4px;font-weight:800;color:#5f574e}
+    .badge.warn{background:#fff0d6;color:#8b5d17}
     .coupon-period-custom{margin-top:10px}
     @media(max-width:760px){
       .reward-grid{grid-template-columns:repeat(2,minmax(120px,1fr))}
       .user-row{grid-template-columns:1fr 1fr}.user-row button{grid-column:1/-1}
-      .history-row{grid-template-columns:1fr}.coupon-row{grid-template-columns:1fr}.coupon-actions{justify-content:flex-start}.wrap{padding:18px 10px 40px}
+      .history-row{grid-template-columns:1fr}.coupon-row{grid-template-columns:1fr}.beta-row{grid-template-columns:1fr 1fr}.beta-row .beta-wide{grid-column:1/-1}.coupon-actions{justify-content:flex-start}.wrap{padding:18px 10px 40px}
     }
   </style>
 </head>
@@ -114,7 +118,6 @@
         <div class="reward-box"><label>⏩ 대기패스권</label><input id="wait_passes" type="number" min="0" value="10"></div>
         <div class="reward-box"><label>🎲 랜덤 씨앗쿠폰</label><input id="random_seed_coupons" type="number" min="0" value="0"></div>
         <div class="reward-box"><label>🌱 지정 씨앗쿠폰</label><input id="choice_seed_coupons" type="number" min="0" value="0"></div>
-        <div class="reward-box"><label>🥚 펫 알</label><input id="pet_eggs" type="number" min="0" value="0"></div>
       </div>
 
       <div style="margin-top:12px"><label>메모 (선택)</label><textarea id="note" maxlength="120" placeholder="예: 9/18 테스터 감사선물"></textarea></div>
@@ -140,7 +143,7 @@
       <div class="row" style="margin-top:14px">
         <div class="grow">
           <label>쿠폰 코드</label>
-          <input id="couponCode" maxlength="32" placeholder="예: A7K3P9">
+          <input id="couponCode" maxlength="32" placeholder="예: FLOWER-THANKS">
         </div>
         <button class="plain" id="couponGenerateBtn">자동 생성</button>
         <div class="grow">
@@ -181,7 +184,6 @@
         <div class="reward-box"><label>⏩ 대기패스권</label><input id="coupon_wait_passes" type="number" min="0" value="0"></div>
         <div class="reward-box"><label>🎲 랜덤 씨앗쿠폰</label><input id="coupon_random_seed_coupons" type="number" min="0" value="0"></div>
         <div class="reward-box"><label>🌱 지정 씨앗쿠폰</label><input id="coupon_choice_seed_coupons" type="number" min="0" value="0"></div>
-        <div class="reward-box"><label>🥚 펫 알</label><input id="coupon_pet_eggs" type="number" min="0" value="0"></div>
       </div>
 
       <div style="margin-top:12px">
@@ -223,6 +225,22 @@
       </div>
     </div>
 
+    <div class="card">
+      <div class="top-actions">
+        <div>
+          <div class="section-title">🧹 베타 잔존 의심 계정</div>
+          <div class="small">2026-10-01 00:00(KST) 이후 서버 갱신 기록이 없는 계정만 표시합니다. 자동 삭제하지 않습니다.</div>
+        </div>
+        <button class="plain" id="betaCandidatesBtn">목록 불러오기</button>
+      </div>
+      <div class="warning" style="margin-top:10px">
+        ⚠ 이 목록은 베타 계정으로 확정된 목록이 아니라 정리 후보입니다. 정원번호와 닉네임을 확인한 뒤 필요한 계정만 별도로 삭제하세요.
+      </div>
+      <div class="result" id="betaCandidateResults" style="margin-top:12px">
+        <div class="small" style="padding:12px 0">버튼을 누르면 후보 목록을 불러옵니다.</div>
+      </div>
+    </div>
+
     <div class="notice">
       🎟 새 쿠폰을 만들 때마다 APK를 다시 올릴 필요는 없습니다. 서버에 쿠폰이 저장되며, 쿠폰 입력 기능이 들어간 게임 버전에서는 새 코드도 바로 사용할 수 있습니다.
     </div>
@@ -236,7 +254,7 @@ let loggedIn = false;
 let selectedUser = null;
 
 const $ = id => document.getElementById(id);
-const rewardKeys = ["king_water_drops","water_drops","gold","lottery_tickets","wait_passes","random_seed_coupons","choice_seed_coupons","pet_eggs"];
+const rewardKeys = ["king_water_drops","water_drops","gold","lottery_tickets","wait_passes","random_seed_coupons","choice_seed_coupons"];
 
 function setConnection(ok, text){
   $("connDot").className = "dot " + (ok ? "ok" : "bad");
@@ -281,6 +299,9 @@ function handleMessage(p){
   }
   else if(p.type==="admin_user_search_result"){
     renderUsers(p.users||[]);
+  }
+  else if(p.type==="admin_beta_candidates_result"){
+    renderBetaCandidates(p.items||[],Number(p.total_count||0),p.cutoff_text||"2026-10-01 00:00 KST",!!p.ok);
   }
   else if(p.type==="admin_reward_send_result"){
     $("sendBtn").disabled=false;
@@ -338,6 +359,45 @@ function renderUsers(users){
     row.append(a,b,c,btn); root.appendChild(row);
   });
 }
+function loadBetaCandidates(){
+  const root=$("betaCandidateResults");
+  root.innerHTML='<div class="small" style="padding:12px 0">후보 계정을 불러오는 중입니다...</div>';
+  send({type:"admin_beta_candidates",cutoff_iso:"2026-10-01T00:00:00+09:00"});
+}
+function renderBetaCandidates(items,totalCount,cutoffText,ok){
+  const root=$("betaCandidateResults");
+  root.innerHTML="";
+  if(!ok){
+    root.innerHTML='<div class="small badtxt" style="padding:12px 0">후보 목록을 불러오지 못했습니다.</div>';
+    return;
+  }
+  const summary=document.createElement("div");
+  summary.className="beta-summary";
+  summary.textContent=`${cutoffText} 이후 갱신 없음 · 총 ${totalCount}개${items.length<totalCount?` (앞 ${items.length}개 표시)`:""}`;
+  root.appendChild(summary);
+  if(!items.length){
+    const empty=document.createElement("div");
+    empty.className="small"; empty.style.padding="12px 0";
+    empty.textContent="조건에 해당하는 계정이 없습니다.";
+    root.appendChild(empty); return;
+  }
+  items.forEach(u=>{
+    const row=document.createElement("div"); row.className="beta-row";
+    const a=document.createElement("div"); a.innerHTML='<div class="strong"></div><div class="small"></div>';
+    a.children[0].textContent=u.nickname||"정원사";
+    a.children[1].textContent=Number(u.duplicate_nickname_count||0)>1?`같은 닉네임 ${u.duplicate_nickname_count}개`:"닉네임 중복 없음";
+    const b=document.createElement("div"); b.innerHTML='<div class="strong"></div><div class="small">정원번호</div>'; b.children[0].textContent=u.garden_number||"-";
+    const c=document.createElement("div"); c.innerHTML=`<div class="strong">Lv.${Number(u.level||0)}</div>`;
+    const d=document.createElement("div"); d.className="beta-wide"; d.innerHTML='<div class="strong"></div><div class="small">마지막 서버 갱신 (KST)</div>'; d.children[0].textContent=u.updated_at_text||"확인 불가";
+    const e=document.createElement("div");
+    if(Number(u.duplicate_nickname_count||0)>1){
+      const badge=document.createElement("span"); badge.className="badge warn"; badge.textContent="중복 닉네임"; e.appendChild(badge);
+    }else{
+      const badge=document.createElement("span"); badge.className="badge expired"; badge.textContent="오래된 계정"; e.appendChild(badge);
+    }
+    row.append(a,b,c,d,e); root.appendChild(row);
+  });
+}
 function updateTargetUI(){
   const kind=$("targetKind").value;
   $("allWarning").classList.toggle("hidden",kind!=="all");
@@ -355,7 +415,7 @@ function rewardPayload(){
   return o;
 }
 function rewardSummary(r){
-  const names={king_water_drops:"왕방울",water_drops:"물방울",gold:"G",lottery_tickets:"복권",wait_passes:"대기패스",random_seed_coupons:"랜덤씨앗쿠폰",choice_seed_coupons:"지정씨앗쿠폰",pet_eggs:"펫 알"};
+  const names={king_water_drops:"왕방울",water_drops:"물방울",gold:"G",lottery_tickets:"복권",wait_passes:"대기패스",random_seed_coupons:"랜덤씨앗쿠폰",choice_seed_coupons:"지정씨앗쿠폰"};
   return rewardKeys.filter(k=>Number(r[k]||0)>0).map(k=>k==="gold"?`${Number(r[k]).toLocaleString()}G`:`${names[k]} ${r[k]}`).join(" · ");
 }
 function sendReward(){
@@ -376,7 +436,7 @@ function sendReward(){
   });
 }
 function setPreset(){
-  const vals={king_water_drops:50,water_drops:100,gold:10000,lottery_tickets:10,wait_passes:10,random_seed_coupons:0,choice_seed_coupons:0,pet_eggs:0};
+  const vals={king_water_drops:50,water_drops:100,gold:10000,lottery_tickets:10,wait_passes:10,random_seed_coupons:0,choice_seed_coupons:0};
   rewardKeys.forEach(k=>$(k).value=vals[k]);
 }
 function clearRewards(){ rewardKeys.forEach(k=>$(k).value=0); }
@@ -387,7 +447,7 @@ function couponRewardPayload(){
   return o;
 }
 function setCouponPreset(){
-  const vals={king_water_drops:50,water_drops:100,gold:10000,lottery_tickets:10,wait_passes:10,random_seed_coupons:0,choice_seed_coupons:0,pet_eggs:0};
+  const vals={king_water_drops:50,water_drops:100,gold:10000,lottery_tickets:10,wait_passes:10,random_seed_coupons:0,choice_seed_coupons:0};
   rewardKeys.forEach(k=>$("coupon_"+k).value=vals[k]);
 }
 function clearCouponRewards(){ rewardKeys.forEach(k=>$("coupon_"+k).value=0); }
@@ -395,10 +455,14 @@ function normalizeCouponCode(v){
   return String(v||"").trim().toUpperCase().replace(/\s+/g,"");
 }
 function generateCouponCode(){
+  const d=new Date();
+  const y=d.getFullYear();
+  const m=String(d.getMonth()+1).padStart(2,"0");
+  const day=String(d.getDate()).padStart(2,"0");
   const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let code="";
-  for(let i=0;i<6;i++) code+=chars[Math.floor(Math.random()*chars.length)];
-  $("couponCode").value=code;
+  let tail="";
+  for(let i=0;i<5;i++) tail+=chars[Math.floor(Math.random()*chars.length)];
+  $("couponCode").value=`FLOWER-${y}${m}${day}-${tail}`;
 }
 function updateCouponPeriodUI(){
   const custom=$("couponPeriod").value==="custom";
@@ -531,6 +595,7 @@ $("sendBtn").onclick=sendReward;
 $("presetBtn").onclick=setPreset;
 $("clearBtn").onclick=clearRewards;
 $("historyBtn").onclick=loadHistory;
+$("betaCandidatesBtn").onclick=loadBetaCandidates;
 $("couponPresetBtn").onclick=setCouponPreset;
 $("couponClearBtn").onclick=clearCouponRewards;
 $("couponGenerateBtn").onclick=generateCouponCode;
