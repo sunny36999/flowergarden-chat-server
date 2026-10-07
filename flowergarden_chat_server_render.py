@@ -3234,6 +3234,92 @@ def search_admin_accounts(query: str, limit: int = 100):
         return [], "admin_user_search_db_error"
 
 
+def load_admin_beta_candidate_accounts(
+    cutoff_iso: str = "2026-10-01T00:00:00+09:00",
+    limit: int = 300,
+):
+    """정식 출시 이후 서버 갱신이 없는 계정을 '베타 잔존 의심' 후보로 조회합니다.
+
+    이 함수는 후보를 보여주기만 하며 계정을 삭제하거나 수정하지 않습니다.
+    updated_at은 account_register 때 갱신되므로 2026-10-01 00:00 KST 이후
+    한 번도 서버에 등록/갱신되지 않은 계정만 반환합니다.
+    """
+    limit = max(1, min(500, int(limit)))
+
+    try:
+        cutoff = datetime.fromisoformat(str(cutoff_iso))
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=KST)
+    except (TypeError, ValueError):
+        cutoff = datetime(2026, 10, 1, 0, 0, tzinfo=KST)
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM gardener_accounts
+                    WHERE updated_at < %s
+                      AND garden_number <> %s
+                    """,
+                    (cutoff, ADMIN_GARDEN_NUMBER),
+                )
+                count_row = cur.fetchone()
+                total_count = int(count_row[0]) if count_row else 0
+
+                cur.execute(
+                    """
+                    SELECT
+                        a.user_id,
+                        a.nickname,
+                        a.garden_number,
+                        a.level,
+                        a.updated_at,
+                        COUNT(*) OVER (PARTITION BY LOWER(a.nickname)) AS nickname_count
+                    FROM gardener_accounts a
+                    WHERE a.updated_at < %s
+                      AND a.garden_number <> %s
+                    ORDER BY a.updated_at ASC, a.garden_number
+                    LIMIT %s
+                    """,
+                    (cutoff, ADMIN_GARDEN_NUMBER, limit),
+                )
+
+                items = []
+                for row in cur.fetchall():
+                    updated_at = row[4]
+                    if updated_at is not None:
+                        updated_at_kst = updated_at.astimezone(KST)
+                        updated_at_text = updated_at_kst.strftime(
+                            "%Y-%m-%d %H:%M"
+                        )
+                        updated_at_iso = updated_at_kst.isoformat(
+                            timespec="seconds"
+                        )
+                    else:
+                        updated_at_text = "확인 불가"
+                        updated_at_iso = ""
+
+                    items.append({
+                        "user_id": str(row[0]),
+                        "nickname": str(row[1]),
+                        "garden_number": str(row[2]).strip(),
+                        "level": int(row[3]),
+                        "updated_at_text": updated_at_text,
+                        "updated_at_iso": updated_at_iso,
+                        "duplicate_nickname_count": int(row[5] or 0),
+                    })
+
+        return items, total_count, ""
+    except Exception as exc:
+        print(
+            "[베타 잔존 의심계정 조회 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return [], 0, "admin_beta_candidates_db_error"
+
+
 def create_admin_reward_send(
     target_kind: str,
     target_user_id: str,
@@ -4664,6 +4750,29 @@ async def handle_admin_user_search(ws, payload: dict):
             "code": error_code or "ok",
             "users": users,
             "query": query,
+        },
+    )
+
+
+async def handle_admin_beta_candidates(ws, payload: dict):
+    if not await require_admin_auth(ws):
+        return
+
+    cutoff_iso = str(
+        payload.get("cutoff_iso", "2026-10-01T00:00:00+09:00")
+    ).strip()
+    items, total_count, error_code = load_admin_beta_candidate_accounts(
+        cutoff_iso
+    )
+    await send_json(
+        ws,
+        {
+            "type": "admin_beta_candidates_result",
+            "ok": not bool(error_code),
+            "code": error_code or "ok",
+            "items": items,
+            "total_count": total_count,
+            "cutoff_text": "2026-10-01 00:00 KST",
         },
     )
 
@@ -6612,6 +6721,9 @@ async def handle_client(ws):
 
             elif msg_type == "admin_user_search":
                 await handle_admin_user_search(ws, payload)
+
+            elif msg_type == "admin_beta_candidates":
+                await handle_admin_beta_candidates(ws, payload)
 
             elif msg_type == "admin_reward_send":
                 await handle_admin_reward_send(ws, payload)
