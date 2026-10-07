@@ -820,6 +820,141 @@ def run_one_time_hera_account_cleanup() -> None:
             f"{type(exc).__name__}: {exc}"
         )
 
+def run_one_time_requested_account_cleanup_20261007() -> None:
+    """운영자가 지정한 기존 테스트/중복 계정 5개를 정원번호+닉네임 일치 시에만 1회 삭제합니다.
+
+    대상:
+    - 렉소 / 147089
+    - 힌츠 / 328452
+    - 헤라 / 294021
+    - 헤라 / 278789
+    - 시리 / 268085
+
+    안전장치:
+    - 정원번호로 먼저 계정을 찾고 닉네임까지 정확히 일치할 때만 삭제합니다.
+    - 수확물장터 판매기록의 FK가 계정 삭제를 막지 않도록 해당 계정 관련 판매기록을 먼저 정리합니다.
+    - 나머지 친구/요청/방명록/꽃밭/선물/채팅/함께하는정원 등은 기존 FK 규칙으로 함께 정리됩니다.
+    - 완료 사실을 server_admin_migrations에 기록하여 이후 같은 번호가 재사용되어도 다시 삭제하지 않습니다.
+    """
+    if not DATABASE_URL:
+        return
+
+    migration_id = "delete_requested_accounts_20261007_v1"
+    targets = [
+        ("147089", "렉소"),
+        ("328452", "힌츠"),
+        ("294021", "헤라"),
+        ("278789", "헤라"),
+        ("268085", "시리"),
+    ]
+
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS server_admin_migrations (
+                        migration_id VARCHAR(120) PRIMARY KEY,
+                        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    "SELECT 1 FROM server_admin_migrations WHERE migration_id = %s",
+                    (migration_id,),
+                )
+                if cur.fetchone() is not None:
+                    return
+
+                deleted_rows = []
+                skipped_rows = []
+
+                for garden_number, expected_nickname in targets:
+                    cur.execute(
+                        """
+                        SELECT user_id, nickname, level
+                        FROM gardener_accounts
+                        WHERE garden_number = %s
+                        FOR UPDATE
+                        """,
+                        (garden_number,),
+                    )
+                    row = cur.fetchone()
+
+                    if row is None:
+                        skipped_rows.append(
+                            (garden_number, expected_nickname, "계정 없음")
+                        )
+                        continue
+
+                    user_id = str(row[0])
+                    actual_nickname = str(row[1])
+                    actual_level = int(row[2])
+
+                    if actual_nickname != expected_nickname:
+                        skipped_rows.append(
+                            (
+                                garden_number,
+                                expected_nickname,
+                                f"닉네임 불일치({actual_nickname})",
+                            )
+                        )
+                        continue
+
+                    # harvest_market_sales는 seller/buyer FK가 ON DELETE CASCADE가 아니므로
+                    # 계정 삭제 전에 해당 계정과 연결된 거래기록을 먼저 지웁니다.
+                    # sale 삭제 시 delivery는 FK ON DELETE CASCADE로 함께 정리됩니다.
+                    cur.execute(
+                        """
+                        DELETE FROM harvest_market_sales
+                        WHERE seller_user_id = %s
+                           OR buyer_user_id = %s
+                           OR listing_id IN (
+                                SELECT listing_id
+                                FROM harvest_market_listings
+                                WHERE seller_user_id = %s
+                           )
+                        """,
+                        (user_id, user_id, user_id),
+                    )
+
+                    cur.execute(
+                        "DELETE FROM gardener_accounts WHERE user_id = %s",
+                        (user_id,),
+                    )
+                    deleted_rows.append(
+                        (garden_number, actual_nickname, actual_level)
+                    )
+
+                cur.execute(
+                    "INSERT INTO server_admin_migrations (migration_id) VALUES (%s)",
+                    (migration_id,),
+                )
+
+            conn.commit()
+
+        print(
+            f"[2026-10-07 지정계정 정리] 삭제 완료: {len(deleted_rows)}명 / "
+            f"건너뜀: {len(skipped_rows)}명"
+        )
+        for garden_number, nickname, level in deleted_rows:
+            print(
+                "[2026-10-07 지정계정 정리] "
+                f"삭제: {nickname} / Lv.{level} / 정원번호 {garden_number}"
+            )
+        for garden_number, nickname, reason in skipped_rows:
+            print(
+                "[2026-10-07 지정계정 정리] "
+                f"건너뜀: {nickname} / 정원번호 {garden_number} / {reason}"
+            )
+
+    except Exception as exc:
+        print(
+            "[2026-10-07 지정계정 정리 오류] "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
 def run_one_time_together_garden_reward_recovery() -> None:
     """기존 1,000송이 목표에서 이미 통과한 10%/25% 미지급 보상을 1회 복구합니다."""
     if not DATABASE_URL:
@@ -969,9 +1104,17 @@ def register_account_record(
     try:
         with get_account_db_connection() as conn:
             with conn.cursor() as cur:
+                # 같은 닉네임의 동시 등록도 직렬화해 새 중복 계정이 생기지 않게 합니다.
+                # DB에 이미 존재하던 레거시 중복 계정은 현재 닉네임을 그대로 유지하는 경우에만
+                # 정상 갱신을 허용하고, 신규 등록/닉네임 변경으로 새 중복을 만드는 것은 차단합니다.
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(LOWER(%s)))",
+                    (nickname,),
+                )
+
                 cur.execute(
                     """
-                    SELECT garden_number
+                    SELECT garden_number, nickname
                     FROM gardener_accounts
                     WHERE user_id = %s
                     """,
@@ -1002,6 +1145,33 @@ def register_account_record(
                         "garden_number_conflict",
                         "이 정원번호가 다른 정원사와 겹쳤어요. 운영자에게 알려주세요.",
                     )
+
+                own_nickname = (
+                    str(own_row[1]).strip() if own_row else ""
+                )
+                keeping_existing_nickname = (
+                    bool(own_row)
+                    and own_nickname.casefold() == nickname.casefold()
+                )
+
+                if not keeping_existing_nickname:
+                    cur.execute(
+                        """
+                        SELECT user_id
+                        FROM gardener_accounts
+                        WHERE LOWER(nickname) = LOWER(%s)
+                          AND user_id <> %s
+                        LIMIT 1
+                        """,
+                        (nickname, user_id),
+                    )
+                    nickname_row = cur.fetchone()
+                    if nickname_row is not None:
+                        return (
+                            False,
+                            "nickname_conflict",
+                            "이미 사용 중인 닉네임이에요. 다른 닉네임을 사용해주세요.",
+                        )
 
                 if own_row:
                     if title_name is None:
@@ -4226,21 +4396,34 @@ async def handle_join(ws, payload: dict):
         )
         return
 
-    state.update(data)
-    state["joined"] = True
-
-    if is_valid_garden_number(state.get("garden_number", "")):
+    # 채팅 입장 전에 현재 닉네임을 계정 DB와 먼저 맞춥니다.
+    # 신규/변경 닉네임이 이미 다른 계정에서 사용 중이면 채팅 입장을 거부해
+    # @닉네임 귓속말 대상이 다시 여러 명으로 갈라지는 것을 막습니다.
+    if is_valid_garden_number(data.get("garden_number", "")):
         account_ok, account_code, account_message = register_account_record(
-            state["nickname"],
-            state["user_id"],
-            state["garden_number"],
-            state["level"],
+            data["nickname"],
+            data["user_id"],
+            data["garden_number"],
+            data["level"],
         )
         if not account_ok:
             print(
                 "[광장 계정등록 경고] "
                 f"{account_code}: {account_message}"
             )
+            if account_code == "nickname_conflict":
+                await send_json(
+                    ws,
+                    {
+                        "type": "join_denied",
+                        "code": account_code,
+                        "message": account_message,
+                    },
+                )
+                return
+
+    state.update(data)
+    state["joined"] = True
 
     mute_remaining = remaining_seconds(
         muted_until_by_user,
@@ -6597,10 +6780,11 @@ async def main():
     if account_db_ready:
         run_one_time_account_cleanup()
         run_one_time_hera_account_cleanup()
+        run_one_time_requested_account_cleanup_20261007()
         run_one_time_together_garden_reward_recovery()
 
     print("=" * 60)
-    print(" FlowerGarden 서버 2026-09-22 / 메인 전체채팅 + @귓속말 / 함께하는 정원 유지")
+    print(" FlowerGarden 서버 2026-10-07 / 지정계정 정리 + 중복닉네임 방지 / 기존 기능 유지")
     print("[MAIN_CHAT_20260922] 메인 전체채팅 + @귓속말 + 최근 50개 저장 적용")
     print("=" * 60)
     print(f"Render 서버 포트: {PORT}")
