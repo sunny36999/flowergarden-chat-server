@@ -839,7 +839,7 @@ def run_one_time_requested_account_cleanup_20261007() -> None:
     if not DATABASE_URL:
         return
 
-migration_id = "delete_requested_accounts_20261008_v1"
+    migration_id = "delete_requested_accounts_20261008_v1"
     targets = [
         ("263932", "헤라"),
         ("935473", "누룽지"),
