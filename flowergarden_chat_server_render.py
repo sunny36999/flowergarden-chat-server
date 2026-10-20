@@ -1,3 +1,4 @@
+# 2026-10-20: 친구 응원 개발 준비. 11/9 05:00 KST 이전 응원 보상/글 비활성. 기존 데이터 보존.
 # 2026-10-01 긴급수정: 함께하는 정원 회차 event_id 동적 분리(매월 1일/16일) + 11월 기여도 0송이 오류 수정
 # 2026-09-26 수확물장터 서버 1.0: 상품등록/조회/검색/취소/비밀번호/동시구매방지/판매기록10건/안전수령함 추가
 # 2026-09-23 친구목록 칭호연동 복구: 9/22 메인채팅 서버에 9/19 실제 사용칭호 동기화(title_name/title_synced) 재병합 / 기존 메인채팅·귓속말·친구·방명록·함께하는정원·쿠폰 유지
@@ -216,6 +217,76 @@ def ensure_account_db() -> bool:
                     """
                     CREATE INDEX IF NOT EXISTS idx_guestbook_owner_created
                     ON gardener_guestbook_entries (owner_user_id, created_at DESC)
+                    """
+                )
+                # 2026-11-09 친구 응원, 자동 방명록 및 양방향 펫 알
+                cur.execute(
+                    """
+                    ALTER TABLE gardener_guestbook_entries
+                    ADD COLUMN IF NOT EXISTS entry_kind VARCHAR(20) NOT NULL DEFAULT 'manual'
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_friend_cheers (
+                        cheer_id BIGSERIAL PRIMARY KEY,
+                        sender_user_id VARCHAR(80) NOT NULL REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        receiver_user_id VARCHAR(80) NOT NULL REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        cheer_day INTEGER NOT NULL,
+                        guestbook_entry_id BIGINT NULL REFERENCES gardener_guestbook_entries(entry_id) ON DELETE SET NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (sender_user_id, receiver_user_id, cheer_day),
+                        CHECK (sender_user_id <> receiver_user_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_friend_cheer_rewards (
+                        delivery_id BIGSERIAL PRIMARY KEY,
+                        cheer_id BIGINT NOT NULL REFERENCES gardener_friend_cheers(cheer_id) ON DELETE CASCADE,
+                        receiver_user_id VARCHAR(80) NOT NULL REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        pet_eggs INTEGER NOT NULL DEFAULT 5,
+                        delivered_at TIMESTAMPTZ NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (cheer_id, receiver_user_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_friend_cheer_rewards_pending
+                    ON gardener_friend_cheer_rewards (receiver_user_id, delivered_at, delivery_id)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_friend_cheer_thanks (
+                        cheer_entry_id BIGINT PRIMARY KEY REFERENCES gardener_guestbook_entries(entry_id) ON DELETE CASCADE,
+                        responder_user_id VARCHAR(80) NOT NULL REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        thanks_entry_id BIGINT NULL REFERENCES gardener_guestbook_entries(entry_id) ON DELETE SET NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gardener_guestbook_seen (
+                        owner_user_id VARCHAR(80) PRIMARY KEY REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                        last_seen_entry_id BIGINT NOT NULL DEFAULT 0
+                    )
+                    """
+                )
+                # 기존 이용자의 과거 방명록 글을 신규 알림으로 오인하지 않도록 초기화.
+                cur.execute(
+                    """
+                    INSERT INTO gardener_guestbook_seen (owner_user_id, last_seen_entry_id)
+                    SELECT a.user_id,
+                        COALESCE((SELECT MAX(g.entry_id)
+                                  FROM gardener_guestbook_entries g
+                                  WHERE g.owner_user_id = a.user_id), 0)
+                    FROM gardener_accounts a
+                    ON CONFLICT (owner_user_id) DO NOTHING
                     """
                 )
                 cur.execute(
@@ -2959,6 +3030,240 @@ def format_guestbook_time(value) -> str:
         return ""
 
 
+# ==================================================
+# 2026-11-09 친구 응원: 서버 중복방지/양쪽 5알/방명록/감사글
+# ==================================================
+FRIEND_CHEER_RELEASE_AT = datetime(2026, 11, 9, 5, 0, tzinfo=KST)
+FRIEND_CHEER_EGG_REWARD = 5
+FRIEND_CHEER_MESSAGES = (
+    "오늘도 꽃길만 걸으세요!",
+    "당신의 정원에 행복을 심고 갑니다!",
+    "예쁜 꽃 많이 피우시라고 응원 놓고 가요!",
+    "정원사님! 오늘도 꽃부자 되세요!",
+    "살금살금 왔다가 응원만 두고 갑니다!",
+    "행운 한 송이 놓고 갈게요!",
+    "오늘의 정원에도 웃음꽃이 피어나길!",
+    "꽃보다 아름다운 하루 보내세요!",
+    "응원 배달 왔습니다! 받아주세요!",
+    "우리 함께 예쁜 정원 만들어가요!",
+)
+FRIEND_THANK_MESSAGES = (
+    "응원 고마워요! 행복 한 송이 보내드려요!",
+    "덕분에 오늘도 힘이 나네요!",
+    "응원 잘 받았어요! 토끼처럼 깡충깡충!",
+    "고마운 마음을 꽃다발에 담아 보냅니다!",
+    "응원 덕분에 제 정원이 더 환해졌어요!",
+    "받은 행복 두 배로 돌려드릴게요!",
+    "정원사님 최고! 오늘도 꽃길 걸으세요!",
+    "따뜻한 응원에 마음까지 활짝 피었어요!",
+    "살짝 놓고 가신 응원, 제가 꽉 잡았어요!",
+    "다음에는 제가 먼저 응원하러 갈게요!",
+)
+
+def friend_cheer_live() -> bool:
+    return datetime.now(KST) >= FRIEND_CHEER_RELEASE_AT
+
+def friend_cheer_day() -> int:
+    # 05:00 KST 일일 리셋
+    return int((datetime.now(KST) - timedelta(hours=5)).strftime("%Y%m%d"))
+
+def friend_cheer_sent_today(user_id: str):
+    if not friend_cheer_live():
+        return []
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT a.garden_number
+                    FROM gardener_friend_cheers c
+                    JOIN gardener_accounts a ON a.user_id = c.receiver_user_id
+                    WHERE c.sender_user_id = %s AND c.cheer_day = %s
+                    """,
+                    (user_id, friend_cheer_day()),
+                )
+                return [str(row[0]).strip() for row in cur.fetchall()]
+    except Exception as exc:
+        print(f"[친구 응원 오늘기록 오류] {type(exc).__name__}: {exc}")
+        return []
+
+def create_friend_cheer(sender_user_id: str, receiver_garden_number: str):
+    if not friend_cheer_live():
+        return False, "not_released", "친구 응원은 11월 9일 오전 5시부터 시작해요."
+    if not is_valid_garden_number(receiver_garden_number):
+        return False, "invalid_number", "친구의 정원번호를 확인해주세요."
+    receiver, err = lookup_account_record(receiver_garden_number)
+    if err or not receiver:
+        return False, "friend_not_found", "친구의 계정을 찾지 못했어요."
+    receiver_user_id = str(receiver["user_id"])
+    if sender_user_id == receiver_user_id:
+        return False, "self_cheer", "내 정원에는 응원할 수 없어요."
+    if get_friend_status(sender_user_id, receiver_user_id) != "friends":
+        return False, "friends_only", "친구가 된 정원사에게만 응원할 수 있어요."
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO gardener_friend_cheers
+                        (sender_user_id, receiver_user_id, cheer_day)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (sender_user_id, receiver_user_id, cheer_day) DO NOTHING
+                    RETURNING cheer_id
+                    """,
+                    (sender_user_id, receiver_user_id, friend_cheer_day()),
+                )
+                inserted = cur.fetchone()
+                if inserted is None:
+                    return False, "already_cheered", "오늘은 이미 이 친구를 응원했어요."
+                cheer_id = int(inserted[0])
+                cur.execute(
+                    """
+                    INSERT INTO gardener_guestbook_entries
+                        (owner_user_id, author_user_id, message, entry_kind)
+                    VALUES (%s, %s, %s, 'cheer')
+                    RETURNING entry_id
+                    """,
+                    (receiver_user_id, sender_user_id,
+                     "🌸 " + secrets.choice(FRIEND_CHEER_MESSAGES)),
+                )
+                guestbook_entry_id = int(cur.fetchone()[0])
+                cur.execute(
+                    "UPDATE gardener_friend_cheers SET guestbook_entry_id = %s WHERE cheer_id = %s",
+                    (guestbook_entry_id, cheer_id),
+                )
+                for user_id in (sender_user_id, receiver_user_id):
+                    cur.execute(
+                        """
+                        INSERT INTO gardener_friend_cheer_rewards
+                            (cheer_id, receiver_user_id, pet_eggs)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (cheer_id, receiver_user_id) DO NOTHING
+                        """,
+                        (cheer_id, user_id, FRIEND_CHEER_EGG_REWARD),
+                    )
+            conn.commit()
+        return True, "ok", "응원을 보냈어요! 서로 펫 알 5개씩 받았어요."
+    except Exception as exc:
+        print(f"[친구 응원 처리 오류] {type(exc).__name__}: {exc}")
+        return False, "friend_cheer_db_error", "응원을 보내지 못했어요. 잠시 후 다시 시도해주세요."
+
+def load_friend_cheer_sync(user_id: str):
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT delivery_id, pet_eggs
+                    FROM gardener_friend_cheer_rewards
+                    WHERE receiver_user_id = %s AND delivered_at IS NULL
+                    ORDER BY delivery_id ASC LIMIT 100
+                    """,
+                    (user_id,),
+                )
+                pending_rewards = [
+                    {"delivery_id": int(row[0]), "pet_eggs": int(row[1])}
+                    for row in cur.fetchall()
+                ]
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM gardener_guestbook_entries g
+                    WHERE g.owner_user_id = %s
+                      AND g.entry_id > COALESCE((
+                        SELECT s.last_seen_entry_id
+                        FROM gardener_guestbook_seen s
+                        WHERE s.owner_user_id = %s
+                      ), 0)
+                    """,
+                    (user_id, user_id),
+                )
+                unread_guestbook_count = int(cur.fetchone()[0])
+        return {"pending_rewards": pending_rewards,
+                "unread_guestbook_count": unread_guestbook_count}, ""
+    except Exception as exc:
+        print(f"[친구 응원 동기화 오류] {type(exc).__name__}: {exc}")
+        return {}, "friend_cheer_sync_db_error"
+
+def ack_friend_cheer_reward(receiver_user_id: str, delivery_id: int):
+    if delivery_id <= 0:
+        return False
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE gardener_friend_cheer_rewards
+                    SET delivered_at = COALESCE(delivered_at, NOW())
+                    WHERE delivery_id = %s AND receiver_user_id = %s
+                    RETURNING delivery_id
+                    """,
+                    (delivery_id, receiver_user_id),
+                )
+                ok = cur.fetchone() is not None
+            conn.commit()
+        return ok
+    except Exception as exc:
+        print(f"[친구 응원 알 수령확인 오류] {type(exc).__name__}: {exc}")
+        return False
+
+def create_friend_cheer_thanks(user_id: str, cheer_entry_id: int):
+    if not friend_cheer_live():
+        return False, "not_released", "11월 9일부터 감사 인사를 보낼 수 있어요."
+    if cheer_entry_id <= 0:
+        return False, "invalid_entry", "응원글을 확인해주세요."
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT owner_user_id, author_user_id, entry_kind
+                    FROM gardener_guestbook_entries
+                    WHERE entry_id = %s FOR UPDATE
+                    """,
+                    (cheer_entry_id,),
+                )
+                found = cur.fetchone()
+                if not found or str(found[2]) != "cheer" or str(found[0]) != user_id:
+                    return False, "invalid_entry", "내 방명록의 응원글만 감사 인사할 수 있어요."
+                supporter_id = str(found[1])
+                if get_friend_status(user_id, supporter_id) != "friends":
+                    return False, "friends_only", "현재 친구에게만 감사 인사를 전할 수 있어요."
+                cur.execute(
+                    """
+                    INSERT INTO gardener_friend_cheer_thanks
+                        (cheer_entry_id, responder_user_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT (cheer_entry_id) DO NOTHING
+                    RETURNING cheer_entry_id
+                    """,
+                    (cheer_entry_id, user_id),
+                )
+                if cur.fetchone() is None:
+                    return False, "already_thanked", "이미 감사 인사를 전했어요."
+                cur.execute(
+                    """
+                    INSERT INTO gardener_guestbook_entries
+                        (owner_user_id, author_user_id, message, entry_kind)
+                    VALUES (%s, %s, %s, 'thanks')
+                    RETURNING entry_id
+                    """,
+                    (supporter_id, user_id, "💌 " + secrets.choice(FRIEND_THANK_MESSAGES)),
+                )
+                thanks_entry_id = int(cur.fetchone()[0])
+                cur.execute(
+                    """
+                    UPDATE gardener_friend_cheer_thanks
+                    SET thanks_entry_id = %s WHERE cheer_entry_id = %s
+                    """,
+                    (thanks_entry_id, cheer_entry_id),
+                )
+            conn.commit()
+        return True, "ok", "고마운 마음을 친구 방명록에 전했어요!"
+    except Exception as exc:
+        print(f"[친구 응원 감사글 오류] {type(exc).__name__}: {exc}")
+        return False, "friend_cheer_thanks_db_error", "감사 인사를 보내지 못했어요."
+
 def load_guestbook(user_id: str, owner_garden_number: str):
     owner, lookup_error = lookup_account_record(owner_garden_number)
     if lookup_error:
@@ -2981,7 +3286,10 @@ def load_guestbook(user_id: str, owner_garden_number: str):
                            a.nickname,
                            a.garden_number,
                            g.message,
-                           g.created_at
+                           g.created_at,
+                           g.entry_kind,
+                           EXISTS (SELECT 1 FROM gardener_friend_cheer_thanks t
+                                   WHERE t.cheer_entry_id = g.entry_id) AS thanked
                     FROM gardener_guestbook_entries g
                     JOIN gardener_accounts a
                       ON a.user_id = g.author_user_id
@@ -3003,7 +3311,25 @@ def load_guestbook(user_id: str, owner_garden_number: str):
                             user_id == author_user_id
                             or user_id == owner_user_id
                         ),
+                        "can_thank": (
+                            is_owner and str(row[6]) == "cheer"
+                            and not bool(row[7]) and friend_cheer_live()
+                        ),
                     })
+                if is_owner:
+                    cur.execute(
+                        """
+                        INSERT INTO gardener_guestbook_seen (owner_user_id, last_seen_entry_id)
+                        SELECT %s, COALESCE(MAX(entry_id), 0)
+                        FROM gardener_guestbook_entries WHERE owner_user_id = %s
+                        ON CONFLICT (owner_user_id) DO UPDATE
+                            SET last_seen_entry_id = GREATEST(
+                                gardener_guestbook_seen.last_seen_entry_id,
+                                EXCLUDED.last_seen_entry_id)
+                        """,
+                        (user_id, user_id),
+                    )
+            conn.commit()
     except Exception as exc:
         print(f"[방명록 불러오기 오류] {type(exc).__name__}: {exc}")
         return None, "guestbook_db_error"
@@ -5028,6 +5354,66 @@ async def handle_friend_request(ws, payload: dict):
     )
 
 
+async def handle_friend_cheer(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    garden_number = str(payload.get("garden_number", "")).strip()
+    ok, code, message = create_friend_cheer(
+        str(state.get("account_user_id", "")), garden_number
+    )
+    await send_json(ws, {
+        "type": "friend_cheer_result",
+        "ok": ok, "code": code, "message": message,
+        "garden_number": garden_number
+    })
+
+async def handle_friend_cheer_sync(ws, _payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    user_id = str(state.get("account_user_id", ""))
+    data, error_code = load_friend_cheer_sync(user_id)
+    await send_json(ws, {
+        "type": "friend_cheer_sync_result",
+        "ok": not bool(error_code),
+        "code": error_code or "ok",
+        **data,
+    })
+
+async def handle_friend_cheer_ack(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    try:
+        delivery_id = int(payload.get("delivery_id", 0))
+    except (TypeError, ValueError):
+        delivery_id = 0
+    ok = ack_friend_cheer_reward(
+        str(state.get("account_user_id", "")), delivery_id
+    )
+    await send_json(ws, {
+        "type": "friend_cheer_ack_result",
+        "ok": ok, "delivery_id": delivery_id
+    })
+
+async def handle_friend_cheer_thanks(ws, payload: dict):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    try:
+        entry_id = int(payload.get("entry_id", 0))
+    except (TypeError, ValueError):
+        entry_id = 0
+    ok, code, message = create_friend_cheer_thanks(
+        str(state.get("account_user_id", "")), entry_id
+    )
+    await send_json(ws, {
+        "type": "friend_cheer_thanks_result",
+        "ok": ok, "code": code, "message": message,
+        "entry_id": entry_id
+    })
+
 async def handle_friend_list(ws, _payload: dict):
     if not await require_registered_account(ws):
         return
@@ -5052,6 +5438,7 @@ async def handle_friend_list(ws, _payload: dict):
             "friends": friends,
             "incoming_requests": incoming,
             "outgoing_requests": outgoing,
+            "cheered_today": friend_cheer_sent_today(str(state.get("account_user_id", ""))),
         },
     )
 
@@ -6763,6 +7150,18 @@ async def handle_client(ws):
 
             elif msg_type == "friend_list":
                 await handle_friend_list(ws, payload)
+
+            elif msg_type == "friend_cheer":
+                await handle_friend_cheer(ws, payload)
+
+            elif msg_type == "friend_cheer_sync":
+                await handle_friend_cheer_sync(ws, payload)
+
+            elif msg_type == "friend_cheer_ack":
+                await handle_friend_cheer_ack(ws, payload)
+
+            elif msg_type == "friend_cheer_thanks":
+                await handle_friend_cheer_thanks(ws, payload)
 
             elif msg_type == "friend_remove":
                 await handle_friend_remove(ws, payload)
