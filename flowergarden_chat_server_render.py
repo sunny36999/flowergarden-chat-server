@@ -6772,9 +6772,16 @@ class _RoseDuelService:
 
     async def _start(self, a, b):
         mid = secrets.token_hex(12)
-        match = dict(id=mid, players=(a,b), start=time.monotonic(),
+        now = time.monotonic()
+        # NPC의 첫 수확도 약간 늦게 시작해 실제 재배 템포를 만듭니다.
+        npc_next = {
+            p['uid']: now + self._rng.uniform(5.0, 11.0)
+            for p in (a, b) if p['ws'] is None
+        }
+        match = dict(id=mid, players=(a,b), start=now,
                      start_wall=datetime.now(timezone.utc),
-                     score={a['uid']:0,b['uid']:0}, actions=set(), pending=set())
+                     score={a['uid']:0,b['uid']:0}, actions=set(), pending=set(),
+                     npc_next=npc_next)
         self.matches[mid] = match
         for p in (a,b):
             if p['ws'] is not None:
@@ -6802,10 +6809,20 @@ class _RoseDuelService:
                 for p in m['players']:
                     if p['ws'] is not None:
                         continue
-                    # NPC도 레벨에 따라 수확력이 달라집니다. 기계적인 고정 점수 방지.
-                    rate = 0.32 + (p['level']-10)*0.008
-                    if self._rng.random() < rate:
-                        m['score'][p['uid']] += self._rng.randint(1, 2 + p['level']//15)
+                    # NPC는 매초 점수를 얻지 않고, 개별 수확 시각에만 기록합니다.
+                    # Lv.10: 보통 8~16초 간격 / Lv.50: 대략 4~12초 간격.
+                    # 실전 가독성과 피로도를 위해 기존 NPC보다 느리게 조절합니다.
+                    current = time.monotonic()
+                    if current < m['npc_next'].get(p['uid'], float('inf')):
+                        continue
+                    level = max(10, min(50, int(p['level'])))
+                    bunch = self._rng.randint(1, 2 + (level - 10) // 20)
+                    m['score'][p['uid']] += bunch
+                    # 긴 쉬는 시간도 섞어 매번 같은 간격으로 오르지 않도록 합니다.
+                    next_gap = 7.5 - (level - 10) * 0.095 + self._rng.uniform(0, 7)
+                    if self._rng.random() < 0.12:
+                        next_gap += self._rng.uniform(3, 8)
+                    m['npc_next'][p['uid']] = current + next_gap
                 await self._broadcast(mid)
         except Exception as exc:
             print('[장미 대결 타이머 오류]', repr(exc))
