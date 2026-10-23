@@ -6710,7 +6710,7 @@ def _duel_recent_real_harvest(user_id, action_id, count, match_started_at):
                 row = cur.fetchone()
                 return row is not None and int(row[0]) == count
     except Exception as exc:
-        print('[장미 대결 수확검증 실패]', type(exc).__name__, str(exc)[:100])
+        print('[꽃 수확 대결 수확검증 실패]', type(exc).__name__, str(exc)[:100])
         return False
 
 
@@ -6809,23 +6809,28 @@ class _RoseDuelService:
                 for p in m['players']:
                     if p['ws'] is not None:
                         continue
-                    # NPC는 매초 점수를 얻지 않고, 개별 수확 시각에만 기록합니다.
-                    # Lv.10: 보통 8~16초 간격 / Lv.50: 대략 4~12초 간격.
-                    # 실전 가독성과 피로도를 위해 기존 NPC보다 느리게 조절합니다.
+                    # 일반 정원사처럼 수확-다음 꽃 준비-잠깐 쉬기를 반복합니다.
+                    # 레벨이 높을수록 수확 간격이 조금 짧아지고, 한 번에 얻는
+                    # 꽃의 수가 많아집니다. 매초 수확하거나 기계적으로 동일하게
+                    # 증가하지 않습니다. 펫과 실제 재배 템포를 반영하기 위한 중간 난이도.
                     current = time.monotonic()
                     if current < m['npc_next'].get(p['uid'], float('inf')):
                         continue
                     level = max(10, min(50, int(p['level'])))
-                    bunch = self._rng.randint(1, 2 + (level - 10) // 20)
+                    strength = (level - 10) / 40.0
+                    minimum_bunch = 1 + round(2 * strength)
+                    maximum_bunch = 4 + round(8 * strength)
+                    bunch = self._rng.randint(minimum_bunch, maximum_bunch)
                     m['score'][p['uid']] += bunch
-                    # 긴 쉬는 시간도 섞어 매번 같은 간격으로 오르지 않도록 합니다.
-                    next_gap = 7.5 - (level - 10) * 0.095 + self._rng.uniform(0, 7)
+                    # Lv.10은 기본 8~12초, Lv.50은 5~9초 사이에 수확.
+                    # 약 12% 확률로 구매/심기/왕방울 보충에 해당하는 휴식 추가.
+                    next_gap = 8.0 - 3.0 * strength + self._rng.uniform(0.0, 4.0)
                     if self._rng.random() < 0.12:
-                        next_gap += self._rng.uniform(3, 8)
+                        next_gap += self._rng.uniform(2.0, 5.0)
                     m['npc_next'][p['uid']] = current + next_gap
                 await self._broadcast(mid)
         except Exception as exc:
-            print('[장미 대결 타이머 오류]', repr(exc))
+            print('[꽃 수확 대결 타이머 오류]', repr(exc))
         finally:
             # 경기 종료 직전 도착한 수확 기록 검증을 최대 3초 기다립니다.
             for _ in range(6):
