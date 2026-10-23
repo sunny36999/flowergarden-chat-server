@@ -1,3 +1,4 @@
+# 2026-10-23 장미 개인전 1:1 10초 매칭 / 180초 / 서버 수확 검증 / 테스트 보상 미지급
 # 2026-10-01 긴급수정: 함께하는 정원 회차 event_id 동적 분리(매월 1일/16일) + 11월 기여도 0송이 오류 수정
 # 2026-09-26 수확물장터 서버 1.0: 상품등록/조회/검색/취소/비밀번호/동시구매방지/판매기록10건/안전수령함 추가
 # 2026-09-23 친구목록 칭호연동 복구: 9/22 메인채팅 서버에 9/19 실제 사용칭호 동기화(title_name/title_synced) 재병합 / 기존 메인채팅·귓속말·친구·방명록·함께하는정원·쿠폰 유지
@@ -6670,6 +6671,269 @@ async def admin_console_loop():
             )
 
 
+# ==================================================
+# 🌹 레드로즈 / 블루로즈 1:1 대결 (테스트 단계)
+# - 이용자 매칭: 반대 진영, 레벨 ±3, 최대 10초
+# - 미매칭시 자동 정원사 / 경기 180초
+# - 실제 수확 기록 조회 후 점수 반영
+# - 기존 DB 구조·협동/보상 기능 변경 없음
+# - 꽃쿠폰/승률/순위 DB 지급 없음 (테스트 전용)
+# ==================================================
+import random as _duel_random
+
+_DUEL_WAIT_SEC = 10
+_DUEL_PLAY_SEC = 180
+_DUEL_LEVEL_GAP = 3
+_DUEL_BOT_NAMES = (
+    '달빛정원', '새벽이슬', '꽃송이77', '별빛화원',
+    '봄바람', '장미한송이', '햇살정원', '초록잎새',
+)
+
+
+def _duel_recent_real_harvest(user_id, action_id, count, match_started_at):
+    """서버의 기존 협동 수확 원장으로 액션·수량을 확인합니다.
+
+    함께하는 정원의 목표치가 꽉 차서 accepted_count=0이어도
+    실제 수확량(requested_count)은 기록되므로 그것을 검증합니다.
+    """
+    if not DATABASE_URL:
+        return False
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT requested_count FROM together_garden_harvest_actions
+                    WHERE user_id=%s AND action_id=%s AND created_at >= %s
+                    ORDER BY created_at DESC LIMIT 1""",
+                    (user_id, action_id, match_started_at - timedelta(seconds=3)),
+                )
+                row = cur.fetchone()
+                return row is not None and int(row[0]) == count
+    except Exception as exc:
+        print('[장미 대결 수확검증 실패]', type(exc).__name__, str(exc)[:100])
+        return False
+
+
+class _RoseDuelService:
+    def __init__(self):
+        self.waiting = {}
+        self.matches = {}
+        self.active = {}
+        self._rng = _duel_random.Random()
+
+    async def _send(self, ws, data):
+        try:
+            await send_json(ws, data)
+        except Exception:
+            pass
+
+    async def join(self, ws, uid, nickname, level, faction):
+        if faction not in ('red', 'blue') or level < 10:
+            await self._send(ws, {'type':'duel_queue_result','ok':False,
+                        'message':'Lv.10부터 진영을 선택해 참가할 수 있어요.'})
+            return
+        if uid in self.active:
+            await self._send(ws, {'type':'duel_queue_result','ok':False,
+                        'message':'이미 진행 중인 대결이 있어요.'})
+            return
+        prev = self.waiting.get(uid)
+        if prev is not None:
+            if prev['ws'] is ws:
+                await self._send(ws, {'type':'duel_queue_result','ok':True})
+            else:
+                await self._send(ws, {'type':'duel_queue_result','ok':False,
+                             'message':'다른 기기에서 대결을 찾고 있어요.'})
+            return
+        me = dict(uid=uid, name=nickname, level=level,
+                  faction=faction, ws=ws, queued_at=time.monotonic())
+        possible = [p for p in self.waiting.values()
+                    if p['faction'] != faction and p['uid'] != uid
+                    and abs(p['level']-level) <= _DUEL_LEVEL_GAP]
+        await self._send(ws, {'type':'duel_queue_result','ok':True})
+        if possible:
+            other = min(possible, key=lambda p:p['queued_at'])
+            self.waiting.pop(other['uid'], None)
+            await self._start(me, other)
+        else:
+            self.waiting[uid] = me
+            asyncio.create_task(self._bot_timeout(uid, me['queued_at']))
+
+    async def _bot_timeout(self, uid, queued_at):
+        await asyncio.sleep(_DUEL_WAIT_SEC)
+        p = self.waiting.get(uid)
+        if p is None or p['queued_at'] != queued_at:
+            return
+        self.waiting.pop(uid, None)
+        npc_level = max(10, min(50, p['level'] + self._rng.randint(-2,2)))
+        npc = dict(uid='bot:'+secrets.token_hex(6),
+                   name=self._rng.choice(_DUEL_BOT_NAMES), level=npc_level,
+                   faction='blue' if p['faction']=='red' else 'red', ws=None)
+        await self._start(p,npc)
+
+    async def _start(self, a, b):
+        mid = secrets.token_hex(12)
+        match = dict(id=mid, players=(a,b), start=time.monotonic(),
+                     start_wall=datetime.now(timezone.utc),
+                     score={a['uid']:0,b['uid']:0}, actions=set(), pending=set())
+        self.matches[mid] = match
+        for p in (a,b):
+            if p['ws'] is not None:
+                self.active[p['uid']] = mid
+        for p, opponent in ((a,b),(b,a)):
+            if p['ws'] is not None:
+                await self._send(p['ws'],{
+                    'type':'duel_match_start','match_id':mid,
+                    'opponent_name':opponent['name'],
+                    'opponent_level':opponent['level'],
+                    'duration_seconds':_DUEL_PLAY_SEC})
+        asyncio.create_task(self._timer(mid))
+
+    async def _timer(self, mid):
+        try:
+            while mid in self.matches:
+                m = self.matches[mid]
+                remaining = _DUEL_PLAY_SEC-(time.monotonic()-m['start'])
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(1, remaining))
+                m = self.matches.get(mid)
+                if m is None:
+                    return
+                for p in m['players']:
+                    if p['ws'] is not None:
+                        continue
+                    # NPC도 레벨에 따라 수확력이 달라집니다. 기계적인 고정 점수 방지.
+                    rate = 0.32 + (p['level']-10)*0.008
+                    if self._rng.random() < rate:
+                        m['score'][p['uid']] += self._rng.randint(1, 2 + p['level']//15)
+                await self._broadcast(mid)
+        except Exception as exc:
+            print('[장미 대결 타이머 오류]', repr(exc))
+        finally:
+            # 경기 종료 직전 도착한 수확 기록 검증을 최대 3초 기다립니다.
+            for _ in range(6):
+                m = self.matches.get(mid)
+                if not m or not m['pending']:
+                    break
+                await asyncio.sleep(0.5)
+            await self._finish(mid)
+
+    async def _broadcast(self, mid):
+        m = self.matches.get(mid)
+        if m is None:
+            return
+        a,b = m['players']
+        for p, opponent in ((a,b),(b,a)):
+            if p['ws'] is not None:
+                await self._send(p['ws'],{
+                    'type':'duel_score','match_id':mid,
+                    'my_score':m['score'][p['uid']],
+                    'opponent_score':m['score'][opponent['uid']]})
+
+    async def harvest(self, ws, uid, mid, action_id, flower_count):
+        m = self.matches.get(mid)
+        if m is None or self.active.get(uid) != mid:
+            return
+        p = next((x for x in m['players'] if x['uid']==uid),None)
+        if p is None or p['ws'] is not ws:
+            return
+        if not isinstance(action_id,str) or not action_id or len(action_id)>180:
+            return
+        if type(flower_count) is not int or not 1 <= flower_count <= 100:
+            return
+        if time.monotonic()-m['start'] >= _DUEL_PLAY_SEC:
+            return
+        key = (uid,action_id)
+        if key in m['actions'] or key in m['pending']:
+            return
+        m['pending'].add(key)
+        asyncio.create_task(self._verify_and_record(mid,uid,key,flower_count))
+
+    async def _verify_and_record(self,mid,uid,key,count):
+        try:
+            for _ in range(12):
+                m = self.matches.get(mid)
+                if m is None:
+                    return
+                # 기존 협동 수확 API와 다른 소켓이어서 원장 반영을 기다립니다.
+                verified = await asyncio.to_thread(
+                    _duel_recent_real_harvest,uid,key[1],count,m['start_wall'])
+                if verified:
+                    if key not in m['actions']:
+                        m['actions'].add(key)
+                        m['score'][uid] += count
+                        await self._broadcast(mid)
+                    return
+                await asyncio.sleep(0.5)
+        finally:
+            m = self.matches.get(mid)
+            if m is not None:
+                m['pending'].discard(key)
+
+    async def _finish(self,mid):
+        m = self.matches.pop(mid,None)
+        if m is None:
+            return
+        a,b = m['players']
+        for p,o in ((a,b),(b,a)):
+            if p['ws'] is None:
+                continue
+            self.active.pop(p['uid'],None)
+            mine = m['score'][p['uid']]
+            theirs = m['score'][o['uid']]
+            outcome = 'win' if mine>theirs else 'lose' if mine<theirs else 'draw'
+            await self._send(p['ws'],{'type':'duel_result','match_id':mid,
+                'my_score':mine,'opponent_score':theirs,'winner':outcome})
+
+    def cancel(self,uid,ws):
+        p = self.waiting.get(uid)
+        if p is not None and p['ws'] is ws:
+            self.waiting.pop(uid,None)
+
+    def disconnect(self,ws):
+        for uid,p in list(self.waiting.items()):
+            if p['ws'] is ws:
+                self.waiting.pop(uid,None)
+        # 진행 중 게임은 3분 종료까지 유지, 재화 지급 없음.
+
+
+rose_duel_service = _RoseDuelService()
+
+
+async def handle_rose_duel_join(ws,payload):
+    if not await require_registered_account(ws):
+        return
+    state = clients[ws]
+    # 클라이언트의 nickname/level/user_id를 그대로 신뢰하지 않습니다.
+    uid = str(state.get('account_user_id',''))
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT nickname,level FROM gardener_accounts WHERE user_id=%s',(uid,))
+                row = cur.fetchone()
+        if row is None:
+            raise ValueError('account_not_found')
+        nickname, level = str(row[0]),int(row[1])
+    except Exception:
+        await send_json(ws,{'type':'duel_queue_result','ok':False,
+                         'message':'정원사 계정 정보를 확인하지 못했어요.'})
+        return
+    await rose_duel_service.join(ws,uid,nickname,level,str(payload.get('faction','')))
+
+
+async def handle_rose_duel_cancel(ws,payload):
+    if not await require_registered_account(ws):
+        return
+    rose_duel_service.cancel(str(clients[ws].get('account_user_id','')),ws)
+    await send_json(ws,{'type':'duel_cancel_result','ok':True})
+
+
+async def handle_rose_duel_harvest(ws,payload):
+    if not await require_registered_account(ws):
+        return
+    await rose_duel_service.harvest(ws,str(clients[ws].get('account_user_id','')),
+        str(payload.get('match_id','')),payload.get('action_id',''),payload.get('flower_count',0))
+
 async def handle_client(ws):
     clients[ws] = {
         "joined": False,
@@ -6797,6 +7061,15 @@ async def handle_client(ws):
             elif msg_type == "together_garden_harvest":
                 await handle_together_garden_harvest(ws, payload)
 
+            elif msg_type == "duel_join":
+                await handle_rose_duel_join(ws, payload)
+
+            elif msg_type == "duel_cancel":
+                await handle_rose_duel_cancel(ws, payload)
+
+            elif msg_type == "duel_harvest":
+                await handle_rose_duel_harvest(ws, payload)
+
             elif msg_type == "together_garden_reward_ack":
                 await handle_together_garden_reward_ack(ws, payload)
 
@@ -6877,6 +7150,7 @@ async def handle_client(ws):
         )
 
     finally:
+        rose_duel_service.disconnect(ws)
         state = clients.pop(ws, None)
 
         if state and state.get("joined"):
