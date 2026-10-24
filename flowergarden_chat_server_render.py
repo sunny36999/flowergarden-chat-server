@@ -1,3 +1,22 @@
+# ============================================================================
+# 2026-10-24 인수인계: 1:1 꽃 수확 대결 서버 / 확정 규칙 반영
+# [확정] 정상 완료된 서버 검증 수확 대결: 이용자별 경기당 꽃쿠폰 1장, 일일 상한 없음.
+#        서버 검증된 실제 수확 1송이 이상 있는 대결만 참가 보상 대상.
+#        NPC 대결도 참가 보상 대상이며, NPC 자신은 꽃쿠폰을 받지 않음.
+# [확정] 좋아요 3곳(team/wins/score), 05:00 KST 리셋, 각각 일일 1장(총 최대 3장).
+# [참여조건] 좋아요는 그날 서버에 저장된 정상 수확 대결 3판 이상 완료 후 수령.
+# [확정] 별도 개인랭킹 2개: 우승 누적 TOP3, 점수 누적 TOP3. 동일인 중복 입상 허용.
+#        레드/블루 팀 승리 기록 별도. 1일/16일 05:00 KST 회차 구분; 과거 기록 보존.
+# [미확정] 1일/16일 진영 보상(승리 8/패배 5), 개인 순위 상금(8/5/3)은
+#        이전 제안 수량이며 정산 지급은 이 서버 수정에서 활성화하지 않음.
+# [미완료] 희귀꽃 150일 차수 교환소에서 꽃쿠폰 차감 및 실제 씨앗/해금 지급.
+# [안전] 기존 계정/협동 정원/수확물 장터/친구/채팅/운영자 지급 기능 변경 금지.
+#        DB 테이블 삭제·초기화 없음. 신규 테이블만 CREATE IF NOT EXISTS 사용.
+#        쿠폰 증가는 PostgreSQL 트랜잭션 내에서 원장 고유키로 중복 방지.
+# [연결] 기존 soil.gd가 이미 사용하는 duel_wallet, duel_ranking_get,
+#        duel_ranking_like, duel_result 필드명과 응답 형태 유지.
+# [배포] 이 파일은 서버 교체용; 배포/실DB 테스트는 별도로 수행해야 합니다.
+# ============================================================================
 # 2026-10-23 장미 개인전 1:1 10초 매칭 / 180초 / 서버 수확 검증 / 테스트 보상 미지급
 # 2026-10-01 긴급수정: 함께하는 정원 회차 event_id 동적 분리(매월 1일/16일) + 11월 기여도 0송이 오류 수정
 # 2026-09-26 수확물장터 서버 1.0: 상품등록/조회/검색/취소/비밀번호/동시구매방지/판매기록10건/안전수령함 추가
@@ -656,35 +675,6 @@ def ensure_account_db() -> bool:
                     ON harvest_market_deliveries (receiver_user_id, claimed_at, delivery_id)
                     """
                 )
-                # 🌸 1:1 꽃 수확 대결 보상 원장 (기존 기능과 독립)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS rose_duel_results (
-                        match_id VARCHAR(24) NOT NULL,
-                        user_id VARCHAR(80) NOT NULL REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
-                        faction VARCHAR(8) NOT NULL CHECK (faction IN ('red','blue')),
-                        opponent_name VARCHAR(64) NOT NULL,
-                        own_score INTEGER NOT NULL CHECK (own_score >= 0),
-                        opponent_score INTEGER NOT NULL CHECK (opponent_score >= 0),
-                        result VARCHAR(8) NOT NULL CHECK (result IN ('win','lose','draw')),
-                        coupons_awarded INTEGER NOT NULL DEFAULT 0 CHECK (coupons_awarded >= 0),
-                        finished_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        PRIMARY KEY(match_id, user_id)
-                    )
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS rose_duel_coupon_ledger (
-                        entry_id BIGSERIAL PRIMARY KEY,
-                        user_id VARCHAR(80) NOT NULL REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
-                        event_key VARCHAR(80) NOT NULL,
-                        amount INTEGER NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        UNIQUE(user_id, event_key)
-                    )
-                """)
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_rose_duel_results_user_time
-                    ON rose_duel_results(user_id, finished_at DESC)
-                """)
             conn.commit()
         return True
     except Exception as exc:
@@ -6701,12 +6691,306 @@ async def admin_console_loop():
 
 
 # ==================================================
-# 🌹 레드로즈 / 블루로즈 1:1 대결 (테스트 단계)
+# 🌸 1:1 장미 대결 DB / 꽃쿠폰 원장 / 개인·진영 랭킹
+# ==================================================
+_DUEL_RANK_CATEGORIES = ('team', 'wins', 'score')
+_DUEL_LIKE_REWARD = 1
+_DUEL_MATCH_REWARD = 1  # 1판당 1장 / 하루 상한 없음
+_DUEL_LIKE_DAILY_MIN_MATCHES = 3
+_duel_db_ready = False
+
+
+def _duel_day_season(now=None):
+    '''정원 일일/회차 모두 한국시간 오전 5시 경계를 사용.'''
+    moment = now if now is not None else datetime.now(KST)
+    shifted = moment.astimezone(KST) - timedelta(hours=5)
+    day_key = shifted.date().isoformat()
+    season_key = (f'{shifted.year:04d}-{shifted.month:02d}-'
+                  + ('01' if shifted.day < 16 else '16'))
+    return day_key, season_key
+
+
+def ensure_duel_database():
+    if not DATABASE_URL:
+        print('[장미 대결 DB] DATABASE_URL이 설정되지 않아 지급 기능 중지')
+        return False
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute('''CREATE TABLE IF NOT EXISTS duel_match_results (
+                    match_id VARCHAR(64) PRIMARY KEY,
+                    day_key VARCHAR(10) NOT NULL,
+                    season_key VARCHAR(10) NOT NULL,
+                    winning_faction VARCHAR(4),
+                    completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CHECK (winning_faction IN ('red','blue') OR winning_faction IS NULL)
+                )''')
+                cur.execute('''CREATE TABLE IF NOT EXISTS duel_player_results (
+                    match_id VARCHAR(64) NOT NULL
+                      REFERENCES duel_match_results(match_id) ON DELETE CASCADE,
+                    user_id VARCHAR(80) NOT NULL
+                      REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                    day_key VARCHAR(10) NOT NULL,
+                    season_key VARCHAR(10) NOT NULL,
+                    faction VARCHAR(4) NOT NULL CHECK (faction IN ('red','blue')),
+                    score INTEGER NOT NULL CHECK (score >= 0),
+                    outcome VARCHAR(4) NOT NULL CHECK (outcome IN ('win','lose','draw')),
+                    coupon_award INTEGER NOT NULL DEFAULT 0 CHECK (coupon_award >= 0),
+                    PRIMARY KEY (match_id,user_id)
+                )''')
+                cur.execute('''CREATE INDEX IF NOT EXISTS duel_player_season_idx
+                    ON duel_player_results(season_key,user_id)''')
+                cur.execute('''CREATE INDEX IF NOT EXISTS duel_player_day_idx
+                    ON duel_player_results(day_key,user_id)''')
+                cur.execute('''CREATE INDEX IF NOT EXISTS duel_match_season_idx
+                    ON duel_match_results(season_key,winning_faction)''')
+                cur.execute('''CREATE TABLE IF NOT EXISTS duel_coupon_wallets (
+                    user_id VARCHAR(80) PRIMARY KEY
+                      REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                    balance BIGINT NOT NULL DEFAULT 0 CHECK (balance >= 0),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )''')
+                cur.execute('''CREATE TABLE IF NOT EXISTS duel_coupon_ledger (
+                    award_key VARCHAR(220) PRIMARY KEY,
+                    user_id VARCHAR(80) NOT NULL
+                      REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                    coupon_amount INTEGER NOT NULL CHECK (coupon_amount > 0),
+                    source VARCHAR(12) NOT NULL CHECK (source IN ('match','like')),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )''')
+                cur.execute('''CREATE INDEX IF NOT EXISTS duel_coupon_ledger_user_idx
+                    ON duel_coupon_ledger(user_id,created_at DESC)''')
+                cur.execute('''CREATE TABLE IF NOT EXISTS duel_ranking_likes (
+                    user_id VARCHAR(80) NOT NULL
+                      REFERENCES gardener_accounts(user_id) ON DELETE CASCADE,
+                    day_key VARCHAR(10) NOT NULL,
+                    category VARCHAR(8) NOT NULL CHECK (category IN ('team','wins','score')),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY(user_id,day_key,category)
+                )''')
+        print('[장미 대결 DB] 경기·랭킹·쿠폰 원장 안전 점검 완료')
+        return True
+    except Exception as exc:
+        print('[장미 대결 DB 초기화 실패]', type(exc).__name__, str(exc)[:240])
+        return False
+
+
+def _duel_credit_in_transaction(cur, uid, award_key, amount, source):
+    '''중복 요청은 0장. 기록과 잔액 증가는 반드시 한 트랜잭션 안에서.'''
+    cur.execute('''INSERT INTO duel_coupon_ledger
+        (award_key,user_id,coupon_amount,source)
+        VALUES(%s,%s,%s,%s) ON CONFLICT(award_key) DO NOTHING
+        RETURNING coupon_amount''', (award_key,uid,amount,source))
+    inserted = cur.fetchone()
+    if inserted is None:
+        return 0
+    cur.execute('''INSERT INTO duel_coupon_wallets(user_id,balance,updated_at)
+        VALUES(%s,%s,NOW())
+        ON CONFLICT(user_id) DO UPDATE SET
+            balance=duel_coupon_wallets.balance + EXCLUDED.balance,
+            updated_at=NOW()''', (uid,amount))
+    return amount
+
+
+def _duel_balance_in_transaction(cur, uid):
+    cur.execute('SELECT balance FROM duel_coupon_wallets WHERE user_id=%s',(uid,))
+    row = cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+def _duel_save_finished_match(match):
+    '''대결 종료를 원자적으로 기록하고 사람 참가자에게만 1장 지급.
+
+    반환값: user_id -> {'coupon_award':int,'coupon_balance':int}
+    DB 장애시 예외 발생 → 서버가 지급 성공으로 응답하지 않음.
+    '''
+    day_key, season_key = _duel_day_season()
+    a,b = match['players']
+    a_score = int(match['score'][a['uid']])
+    b_score = int(match['score'][b['uid']])
+    winning_faction = a['faction'] if a_score > b_score else (b['faction'] if b_score > a_score else None)
+    results = {}
+    with get_account_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''INSERT INTO duel_match_results
+                (match_id,day_key,season_key,winning_faction)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT(match_id) DO NOTHING RETURNING match_id''',
+                (match['id'],day_key,season_key,winning_faction))
+            is_new = cur.fetchone() is not None
+            for p,score,opponent_score in ((a,a_score,b_score),(b,b_score,a_score)):
+                if p['ws'] is None or p['uid'].startswith('bot:'):
+                    continue
+                uid=p['uid']
+                outcome=('win' if score>opponent_score else
+                         'lose' if score<opponent_score else 'draw')
+                if is_new:
+                    cur.execute('''INSERT INTO duel_player_results
+                        (match_id,user_id,day_key,season_key,faction,score,outcome,coupon_award)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT(match_id,user_id) DO NOTHING RETURNING user_id''',
+                        (match['id'],uid,day_key,season_key,p['faction'],score,outcome,
+                         _DUEL_MATCH_REWARD if score>0 else 0))
+                    if cur.fetchone() is not None and score>0:
+                        awarded = _duel_credit_in_transaction(cur,uid,
+                                f'match:{match["id"]}:{uid}',_DUEL_MATCH_REWARD,'match')
+                    else:
+                        awarded = 0
+                else:
+                    awarded=0
+                results[uid]={'coupon_award':awarded,
+                              'coupon_balance':_duel_balance_in_transaction(cur,uid)}
+    return results
+
+
+def _duel_wallet_snapshot(uid):
+    with get_account_db_connection() as conn:
+        with conn.cursor() as cur:
+            balance = _duel_balance_in_transaction(cur,uid)
+            cur.execute('''SELECT
+                COUNT(*) FILTER(WHERE outcome='win'),
+                COUNT(*) FILTER(WHERE outcome='lose'),
+                COUNT(*) FILTER(WHERE outcome='draw')
+                FROM duel_player_results WHERE user_id=%s''',(uid,))
+            counts=cur.fetchone() or (0,0,0)
+    return {'balance':balance,'wins':int(counts[0] or 0),
+            'losses':int(counts[1] or 0),'draws':int(counts[2] or 0)}
+
+
+def _duel_ranking_snapshot(uid, requested_season=''):
+    day, current_season = _duel_day_season()
+    season = current_season
+    # 지난 회차 조회는 DB에 기록이 있는 날짜 키만 허용합니다.
+    if requested_season:
+        if not re.fullmatch(r'20\d{2}-(0[1-9]|1[0-2])-(01|16)',requested_season):
+            raise ValueError('잘못된 랭킹 회차입니다.')
+        if requested_season > current_season:
+            raise ValueError('미래 회차를 조회할 수 없어요.')
+        season = requested_season
+    with get_account_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''SELECT winning_faction,COUNT(*) FROM duel_match_results
+                WHERE season_key=%s AND winning_faction IS NOT NULL
+                GROUP BY winning_faction''',(season,))
+            sides={str(row[0]):int(row[1]) for row in cur.fetchall()}
+            cur.execute('''SELECT a.nickname,
+                    COALESCE(SUM((d.outcome='win')::integer),0)::bigint AS wins
+                FROM duel_player_results d JOIN gardener_accounts a
+                  ON a.user_id=d.user_id
+                WHERE d.season_key=%s
+                GROUP BY d.user_id,a.nickname
+                HAVING SUM((d.outcome='win')::integer) > 0
+                ORDER BY wins DESC,a.nickname ASC,d.user_id ASC LIMIT 3''',(season,))
+            top_wins=[{'nickname':str(r[0]),'wins':int(r[1])} for r in cur.fetchall()]
+            cur.execute('''SELECT a.nickname,SUM(d.score)::bigint AS points
+                FROM duel_player_results d JOIN gardener_accounts a
+                  ON a.user_id=d.user_id
+                WHERE d.season_key=%s
+                GROUP BY d.user_id,a.nickname
+                HAVING SUM(d.score) > 0
+                ORDER BY points DESC,a.nickname ASC,d.user_id ASC LIMIT 3''',(season,))
+            top_scores=[{'nickname':str(r[0]),'score':int(r[1])} for r in cur.fetchall()]
+            cur.execute('''SELECT category FROM duel_ranking_likes
+                WHERE user_id=%s AND day_key=%s''',(uid,day))
+            likes={str(r[0]) for r in cur.fetchall()}
+    return {'red_wins':sides.get('red',0),'blue_wins':sides.get('blue',0),
+            'wins_top':top_wins,'score_top':top_scores,
+            'liked_today':[c in likes for c in _DUEL_RANK_CATEGORIES],
+            'season_key':season,'day_key':day}
+
+
+def _duel_like(uid,category):
+    if category not in _DUEL_RANK_CATEGORIES:
+        return {'ok':False,'category':category,'message':'좋아요 부문을 확인해주세요.'}
+    day,_ = _duel_day_season()
+    with get_account_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT level FROM gardener_accounts WHERE user_id=%s',(uid,))
+            account=cur.fetchone()
+            if account is None or int(account[0]) < 10:
+                return {'ok':False,'category':category,'message':'Lv.10부터 참여할 수 있어요.'}
+            cur.execute('''SELECT COUNT(*) FROM duel_player_results
+                WHERE user_id=%s AND day_key=%s AND score>0''',(uid,day))
+            n=int(cur.fetchone()[0])
+            if n < _DUEL_LIKE_DAILY_MIN_MATCHES:
+                return {'ok':False,'category':category,'matches_today':n,
+                        'message':f'오늘 정상 대결 {3-n}판을 더 완료하면 좋아요 보상을 받을 수 있어요.'}
+            cur.execute('''INSERT INTO duel_ranking_likes(user_id,day_key,category)
+                VALUES(%s,%s,%s) ON CONFLICT(user_id,day_key,category)
+                DO NOTHING RETURNING category''',(uid,day,category))
+            inserted=cur.fetchone() is not None
+            awarded=(_duel_credit_in_transaction(cur,uid,
+                    f'like:{day}:{uid}:{category}',_DUEL_LIKE_REWARD,'like')
+                     if inserted else 0)
+            cur.execute('SELECT category FROM duel_ranking_likes WHERE user_id=%s AND day_key=%s',(uid,day))
+            all_liked={str(r[0]) for r in cur.fetchall()}
+            balance=_duel_balance_in_transaction(cur,uid)
+    return {'ok':True,'category':category,'awarded':awarded>0,
+            'balance':balance,'liked_today':[c in all_liked for c in _DUEL_RANK_CATEGORIES],
+            'message':'좋아요 완료!' if awarded else '오늘 이미 좋아요 보상을 받았어요.'}
+
+
+async def handle_duel_wallet(ws,_payload):
+    if not await require_registered_account(ws):
+        return
+    uid=str(clients[ws].get('account_user_id',''))
+    if not _duel_db_ready:
+        await send_json(ws,{'type':'duel_wallet_result','ok':False,
+            'message':'꽃쿠폰 서버가 준비되지 않았어요.'})
+        return
+    try:
+        data=await asyncio.to_thread(_duel_wallet_snapshot,uid)
+        await send_json(ws,dict(type='duel_wallet_result',ok=True,**data))
+    except Exception as exc:
+        print('[장미 지갑 조회 오류]',repr(exc))
+        await send_json(ws,{'type':'duel_wallet_result','ok':False,
+            'message':'꽃쿠폰 지갑 조회에 실패했어요.'})
+
+
+async def handle_duel_ranking_get(ws,payload):
+    if not await require_registered_account(ws):
+        return
+    if not _duel_db_ready:
+        await send_json(ws,{'type':'duel_ranking_result','ok':False,
+            'message':'랭킹 서버가 아직 준비되지 않았어요.'})
+        return
+    uid=str(clients[ws].get('account_user_id',''))
+    try:
+        data=await asyncio.to_thread(_duel_ranking_snapshot,uid,str(payload.get('season_key',''))[:40])
+        await send_json(ws,dict(type='duel_ranking_result',ok=True,**data))
+    except ValueError as exc:
+        await send_json(ws,{'type':'duel_ranking_result','ok':False,'message':str(exc)})
+    except Exception as exc:
+        print('[장미 랭킹 조회 오류]',repr(exc))
+        await send_json(ws,{'type':'duel_ranking_result','ok':False,
+            'message':'랭킹 조회에 실패했어요.'})
+
+
+async def handle_duel_ranking_like(ws,payload):
+    if not await require_registered_account(ws):
+        return
+    if not _duel_db_ready:
+        await send_json(ws,{'type':'duel_ranking_like_result','ok':False,
+            'message':'좋아요 서버가 준비되지 않았어요.'})
+        return
+    uid=str(clients[ws].get('account_user_id',''))
+    category=str(payload.get('category',''))[:30]
+    try:
+        data=await asyncio.to_thread(_duel_like,uid,category)
+        await send_json(ws,dict(type='duel_ranking_like_result',**data))
+    except Exception as exc:
+        print('[장미 좋아요 지급 오류]',repr(exc))
+        await send_json(ws,{'type':'duel_ranking_like_result','ok':False,
+            'message':'좋아요 지급을 완료하지 못했어요.'})
+
+
+# ==================================================
+# 🌹 레드로즈 / 블루로즈 1:1 대결 (DB 보상/랭킹 연결)
 # - 이용자 매칭: 반대 진영, 레벨 ±3, 최대 10초
 # - 미매칭시 자동 정원사 / 경기 180초
 # - 실제 수확 기록 조회 후 점수 반영
 # - 기존 DB 구조·협동/보상 기능 변경 없음
-# - 꽃쿠폰/승률/순위 DB 지급 없음 (테스트 전용)
+# - PostgreSQL DB 저장/랭킹 및 검증 수확 완료당 1쿠폰 지급
 # ==================================================
 import random as _duel_random
 
@@ -6739,107 +7023,8 @@ def _duel_recent_real_harvest(user_id, action_id, count, match_started_at):
                 row = cur.fetchone()
                 return row is not None and int(row[0]) == count
     except Exception as exc:
-        print('[꽃 수확 대결 수확검증 실패]', type(exc).__name__, str(exc)[:100])
+        print('[장미 대결 수확검증 실패]', type(exc).__name__, str(exc)[:100])
         return False
-
-
-
-# 꽃쿠폰은 기존 '기프트 쿠폰'과 다른 대결 전용 통화입니다.
-# 시험 운영 기준. 정식 보상은 별도 논의 후 이 세 값만 조정하세요.
-_DUEL_COUPON_WIN = 10
-_DUEL_COUPON_LOSE = 5
-_DUEL_COUPON_DRAW = 7
-
-
-def _duel_coupon_award(outcome, my_score):
-    if my_score <= 0:  # 수확하지 않은 경기에 무상 보상 지급 방지
-        return 0
-    return {'win': _DUEL_COUPON_WIN,
-            'lose': _DUEL_COUPON_LOSE,
-            'draw': _DUEL_COUPON_DRAW}.get(outcome, 0)
-
-
-def _duel_read_wallet(user_id):
-    """대결별 원장 합계를 조회 (미리 발급된 꽃쿠폰을 신뢰하지 않음)."""
-    if not DATABASE_URL:
-        raise RuntimeError('rose_duel_database_unavailable')
-    with get_account_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""SELECT COALESCE(SUM(amount), 0)
-                FROM rose_duel_coupon_ledger WHERE user_id=%s""", (user_id,))
-            balance = int(cur.fetchone()[0])
-            cur.execute("""SELECT result, COUNT(*) FROM rose_duel_results
-                WHERE user_id=%s GROUP BY result""", (user_id,))
-            counts = {str(k): int(v) for k,v in cur.fetchall()}
-            cur.execute("""SELECT opponent_name, own_score, opponent_score,
-                    result, coupons_awarded
-                FROM rose_duel_results WHERE user_id=%s
-                ORDER BY finished_at DESC, match_id DESC LIMIT 5""", (user_id,))
-            recent = [{'opponent_name':name, 'my_score':int(mine),
-                       'opponent_score':int(other), 'result':result,
-                       'coupon_award':int(award)}
-                      for name,mine,other,result,award in cur.fetchall()]
-    return {'balance':balance, 'wins':counts.get('win',0),
-            'losses':counts.get('lose',0), 'draws':counts.get('draw',0),
-            'recent':recent}
-
-
-def _duel_store_match(match):
-    """한 트랜잭션에서 양쪽 결과+쿠폰을 기록합니다. 매치ID 중복 지급 불가."""
-    if not DATABASE_URL:
-        raise RuntimeError('rose_duel_database_unavailable')
-    a, b = match['players']
-    players = ((a,b),(b,a))
-    output = {}
-    with get_account_db_connection() as conn:
-        with conn.cursor() as cur:
-            for p,other in players:
-                if p['ws'] is None:  # 자동 상대는 보상을 받지 않음
-                    continue
-                mine = int(match['score'][p['uid']])
-                theirs = int(match['score'][other['uid']])
-                result = 'win' if mine > theirs else 'lose' if mine < theirs else 'draw'
-                earned = _duel_coupon_award(result, mine)
-                cur.execute("""INSERT INTO rose_duel_results
-                    (match_id, user_id, faction, opponent_name,
-                     own_score, opponent_score, result, coupons_awarded)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (match_id,user_id) DO NOTHING
-                    RETURNING coupons_awarded""",
-                    (match['id'], p['uid'], p['faction'], other['name'],
-                     mine, theirs, result, earned))
-                inserted = cur.fetchone()
-                if inserted is None:
-                    # 재시도: 이미 저장된 값과 원장을 읽을 뿐 절대 재발급하지 않음.
-                    cur.execute("""SELECT coupons_awarded FROM rose_duel_results
-                        WHERE match_id=%s AND user_id=%s""", (match['id'],p['uid']))
-                    earned = int(cur.fetchone()[0])
-                elif earned > 0:
-                    cur.execute("""INSERT INTO rose_duel_coupon_ledger
-                        (user_id,event_key,amount) VALUES (%s,%s,%s)
-                        ON CONFLICT (user_id,event_key) DO NOTHING""",
-                        (p['uid'], 'duel:'+match['id'], earned))
-                output[p['uid']] = earned
-            # 트랜잭션 안에서 잔액 확인 (지급 실패 시 함께 롤백)
-            for uid, earned in list(output.items()):
-                cur.execute("""SELECT COALESCE(SUM(amount), 0)
-                    FROM rose_duel_coupon_ledger WHERE user_id=%s""", (uid,))
-                output[uid] = {'coupon_award':earned,'coupon_balance':int(cur.fetchone()[0])}
-        conn.commit()
-    return output
-
-
-async def handle_rose_duel_wallet(ws, _payload):
-    if not await require_registered_account(ws):
-        return
-    uid = str(clients[ws].get('account_user_id',''))
-    try:
-        wallet = await asyncio.to_thread(_duel_read_wallet, uid)
-        await send_json(ws, {'type':'duel_wallet_result','ok':True, **wallet})
-    except Exception as exc:
-        print('[꽃 수확 대결 지갑조회 오류]', repr(exc))
-        await send_json(ws, {'type':'duel_wallet_result','ok':False,
-                             'message':'대결 기록을 아직 불러오지 못했어요.'})
 
 
 class _RoseDuelService:
@@ -6937,28 +7122,23 @@ class _RoseDuelService:
                 for p in m['players']:
                     if p['ws'] is not None:
                         continue
-                    # 일반 정원사처럼 수확-다음 꽃 준비-잠깐 쉬기를 반복합니다.
-                    # 레벨이 높을수록 수확 간격이 조금 짧아지고, 한 번에 얻는
-                    # 꽃의 수가 많아집니다. 매초 수확하거나 기계적으로 동일하게
-                    # 증가하지 않습니다. 펫과 실제 재배 템포를 반영하기 위한 중간 난이도.
+                    # NPC는 매초 점수를 얻지 않고, 개별 수확 시각에만 기록합니다.
+                    # Lv.10: 보통 8~16초 간격 / Lv.50: 대략 4~12초 간격.
+                    # 실전 가독성과 피로도를 위해 기존 NPC보다 느리게 조절합니다.
                     current = time.monotonic()
                     if current < m['npc_next'].get(p['uid'], float('inf')):
                         continue
                     level = max(10, min(50, int(p['level'])))
-                    strength = (level - 10) / 40.0
-                    minimum_bunch = 1 + round(2 * strength)
-                    maximum_bunch = 4 + round(8 * strength)
-                    bunch = self._rng.randint(minimum_bunch, maximum_bunch)
+                    bunch = self._rng.randint(1, 2 + (level - 10) // 20)
                     m['score'][p['uid']] += bunch
-                    # Lv.10은 기본 8~12초, Lv.50은 5~9초 사이에 수확.
-                    # 약 12% 확률로 구매/심기/왕방울 보충에 해당하는 휴식 추가.
-                    next_gap = 8.0 - 3.0 * strength + self._rng.uniform(0.0, 4.0)
+                    # 긴 쉬는 시간도 섞어 매번 같은 간격으로 오르지 않도록 합니다.
+                    next_gap = 7.5 - (level - 10) * 0.095 + self._rng.uniform(0, 7)
                     if self._rng.random() < 0.12:
-                        next_gap += self._rng.uniform(2.0, 5.0)
+                        next_gap += self._rng.uniform(3, 8)
                     m['npc_next'][p['uid']] = current + next_gap
                 await self._broadcast(mid)
         except Exception as exc:
-            print('[꽃 수확 대결 타이머 오류]', repr(exc))
+            print('[장미 대결 타이머 오류]', repr(exc))
         finally:
             # 경기 종료 직전 도착한 수확 기록 검증을 최대 3초 기다립니다.
             for _ in range(6):
@@ -7024,28 +7204,33 @@ class _RoseDuelService:
         m = self.matches.pop(mid,None)
         if m is None:
             return
-        a,b = m['players']
-        # 블로킹 DB 작업은 이벤트 루프에서 실행하지 않음.
-        saved = {}
-        persist_error = False
-        try:
-            saved = await asyncio.to_thread(_duel_store_match, m)
-        except Exception as exc:
-            persist_error = True
-            print('[꽃 수확 대결 결과 저장 실패]', repr(exc))
+        a,b=m['players']
+        for p in (a,b):
+            if p['ws'] is not None:
+                self.active.pop(p['uid'],None)
+        saved={}
+        record_saved=False
+        if _duel_db_ready:
+            try:
+                # DB I/O는 작업 스레드에 맡겨 다른 WebSocket 작업을 막지 않습니다.
+                saved=await asyncio.to_thread(_duel_save_finished_match,m)
+                record_saved=True
+            except Exception as exc:
+                print('[장미 대결 기록/쿠폰 지급 실패]',type(exc).__name__,str(exc)[:200])
         for p,o in ((a,b),(b,a)):
             if p['ws'] is None:
                 continue
-            self.active.pop(p['uid'],None)
-            mine = m['score'][p['uid']]
-            theirs = m['score'][o['uid']]
-            outcome = 'win' if mine>theirs else 'lose' if mine<theirs else 'draw'
-            reward = saved.get(p['uid'], {})
-            await self._send(p['ws'],{'type':'duel_result','match_id':mid,
+            mine=int(m['score'][p['uid']])
+            theirs=int(m['score'][o['uid']])
+            outcome='win' if mine>theirs else 'lose' if mine<theirs else 'draw'
+            user_record=saved.get(p['uid'],{})
+            await self._send(p['ws'],{
+                'type':'duel_result','match_id':mid,
                 'my_score':mine,'opponent_score':theirs,'winner':outcome,
-                'record_saved':not persist_error,
-                'coupon_award':int(reward.get('coupon_award',0)),
-                'coupon_balance':int(reward.get('coupon_balance',0))})
+                'record_saved':record_saved,
+                'coupon_award':int(user_record.get('coupon_award',0)),
+                'coupon_balance':int(user_record.get('coupon_balance',0))
+            })
 
     def cancel(self,uid,ws):
         p = self.waiting.get(uid)
@@ -7223,6 +7408,15 @@ async def handle_client(ws):
             elif msg_type == "together_garden_harvest":
                 await handle_together_garden_harvest(ws, payload)
 
+            elif msg_type == "duel_wallet":
+                await handle_duel_wallet(ws, payload)
+
+            elif msg_type == "duel_ranking_get":
+                await handle_duel_ranking_get(ws, payload)
+
+            elif msg_type == "duel_ranking_like":
+                await handle_duel_ranking_like(ws, payload)
+
             elif msg_type == "duel_join":
                 await handle_rose_duel_join(ws, payload)
 
@@ -7231,9 +7425,6 @@ async def handle_client(ws):
 
             elif msg_type == "duel_harvest":
                 await handle_rose_duel_harvest(ws, payload)
-
-            elif msg_type == "duel_wallet":
-                await handle_rose_duel_wallet(ws, payload)
 
             elif msg_type == "together_garden_reward_ack":
                 await handle_together_garden_reward_ack(ws, payload)
@@ -7324,7 +7515,10 @@ async def handle_client(ws):
 
 
 async def main():
+    global _duel_db_ready
     account_db_ready = ensure_account_db()
+    _duel_db_ready = ensure_duel_database() if account_db_ready else False
+    print('[장미 대결] 쿠폰·랭킹:', 'DB 연결 완료' if _duel_db_ready else 'DB 연결 실패 / 보상 중지')
     if account_db_ready:
         run_one_time_account_cleanup()
         run_one_time_hera_account_cleanup()
