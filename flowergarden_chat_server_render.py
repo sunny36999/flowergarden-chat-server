@@ -1,4 +1,27 @@
 # ============================================================================
+# 2026-10-25 인수인계: 장미 1:1 대결 자동 상대 레벨별 4단계 난이도 (이번 수정)
+# [요청] Godot soil.gd/그림은 수정하지 않음. 기존 서버 DB·꽃쿠폰·랭킹 유지.
+# [자동상대] 정원사 Lv.10~19 / 20~29 / 30~39 / 40~50의 네 구간.
+#   각 구간에서 매 경기 초보 10% · 일반 40% · 숙련 40% · 달인 10% 추첨.
+#   숙련도는 경기 시작 시 1회 확정, 진행 중 이용자 점수로 난이도 변경 금지.
+#   수확 간격: 초보 9~13초 / 일반 6~8초 / 숙련 4.5~5.6초 / 달인 3.7~4.4초.
+#   사람처럼 짧은 휴식 간혹 발생하며, 수확할 때만 점수 증가.
+# [레벨별 정원] Lv.10~19 중앙 100%; Lv.20~29 중앙30%/오른쪽70%;
+#   Lv.30~50 중앙20%/오른쪽30%/왼쪽50%.
+#   정원별 실제 배율: 중앙1배·오른쪽2배·왼쪽3배.
+# [가상 꽃레벨] 10~19: 꽃Lv.1~3(기본3), 20~29:Lv.4~6(기본4),
+#   30~39:Lv.7~9(기본5), 40~50:Lv.10~12(기본6).
+#   위 꽃레벨은 봇의 가상 수확량 계산용이며 실제 유저 꽃 레벨을 바꾸지 않음.
+#   가상 봇은 실제 꽃 소유/재배 쿨타임을 저장하지 않음(확률 기반 시뮬레이션).
+# [공정성] 봇 레벨은 정원사 레벨과 동일. 진영은 반대 진영, 인간 매칭 ±3 유지.
+#   유저 펫 효과는 기존 Godot/협동 수확 원장에서 검증된 점수에 그대로 포함.
+#   봇에게 별도 펫 보너스 적용 안 함. 상대 점수 추격용 조작 금지.
+# [기존 보상] 정상수확 완료경기 1판당 쿠폰 1장, 일일 제한 없음.
+#   랭킹/좋아요(05:00 초기화)/DB 중복 지급 방지 로직 수정하지 않음.
+# [주의] 서버 문법 및 오프라인 봇 시뮬레이션 검증. 실제 Render 배포·실DB
+#   대전 테스트 미실시. 운영 배포 전에 기존 서버 소스 백업 필수.
+# ============================================================================
+# ============================================================================
 # 2026-10-24 인수인계: 1:1 꽃 수확 대결 서버 / 확정 규칙 반영
 # [확정] 정상 완료된 서버 검증 수확 대결: 이용자별 경기당 꽃쿠폰 1장, 일일 상한 없음.
 #        서버 검증된 실제 수확 1송이 이상 있는 대결만 참가 보상 대상.
@@ -7002,6 +7025,77 @@ _DUEL_BOT_NAMES = (
     '봄바람', '장미한송이', '햇살정원', '초록잎새',
 )
 
+# 자동 상대의 네 가지 실력은 모든 레벨 구간에 존재합니다.
+# (키, 한글이름, 가중치, 최소간격, 최대간격, 휴식확률)
+_DUEL_BOT_SKILLS = (
+    ('novice', '초보', 10, 9.0, 13.0, 0.12),
+    ('normal', '일반', 40, 6.0, 8.0, 0.08),
+    ('skilled', '숙련', 40, 4.5, 5.6, 0.04),
+    ('master', '달인', 10, 3.7, 4.4, 0.02),
+)
+
+
+def _duel_bot_level_group(level):
+    """실제 수확 정원 개방 단계와 꽃 레벨 가정의 경계."""
+    level = max(10, min(50, int(level)))
+    if level < 20:
+        return 0
+    if level < 30:
+        return 1
+    if level < 40:
+        return 2
+    return 3
+
+
+def _duel_bot_flower_base_yield(flower_level):
+    """soil.gd의 get_flower_harvest_yield() 단계와 일치시킵니다."""
+    amount = 3
+    for threshold in (4, 7, 10, 13, 16, 19, 20):
+        if flower_level >= threshold:
+            amount += 1
+    return amount
+
+
+def _duel_bot_make_profile(level, rng):
+    """경기 시작 전에 한 번만 뽑는 봇 숙련도와 가상 꽃 레벨."""
+    group = _duel_bot_level_group(level)
+    flower_level_min_max = ((1, 3), (4, 6), (7, 9), (10, 12))
+    first, last = flower_level_min_max[group]
+    flower_level = rng.randint(first, last)
+    skill = rng.choices(
+        _DUEL_BOT_SKILLS,
+        weights=[entry[2] for entry in _DUEL_BOT_SKILLS],
+        k=1,
+    )[0]
+    # 중앙/오른쪽/왼쪽의 가중치. 오른쪽=2배, 왼쪽=3배.
+    garden_weights = ((100, 0, 0), (30, 70, 0),
+                      (20, 30, 50), (20, 30, 50))[group]
+    return {
+        'skill_key': skill[0],
+        'skill_name': skill[1],
+        'interval_min': skill[3],
+        'interval_max': skill[4],
+        'pause_chance': skill[5],
+        'flower_level': flower_level,
+        'base_yield': _duel_bot_flower_base_yield(flower_level),
+        'garden_weights': garden_weights,
+    }
+
+
+def _duel_bot_delay(profile, rng):
+    """수확 간격을 경기마다 살짝 흔들고, 아주 가끔 휴식합니다."""
+    delay = rng.uniform(profile['interval_min'], profile['interval_max'])
+    if rng.random() < profile['pause_chance']:
+        delay += rng.uniform(1.5, 3.0)
+    return delay
+
+
+def _duel_bot_harvest_amount(profile, rng):
+    """해금된 정원에서 가상 꽃 한 번을 수확한 양."""
+    multiplier = rng.choices((1, 2, 3), weights=profile['garden_weights'], k=1)[0]
+    return profile['base_yield'] * multiplier
+
+
 
 def _duel_recent_real_harvest(user_id, action_id, count, match_started_at):
     """서버의 기존 협동 수확 원장으로 액션·수량을 확인합니다.
@@ -7077,20 +7171,24 @@ class _RoseDuelService:
         if p is None or p['queued_at'] != queued_at:
             return
         self.waiting.pop(uid, None)
-        npc_level = max(10, min(50, p['level'] + self._rng.randint(-2,2)))
+        # 정원/꽃 레벨 경계를 넘겨 매칭하지 않도록 이용자 레벨과 동일하게.
+        npc_level = max(10, min(50, int(p['level'])))
         npc = dict(uid='bot:'+secrets.token_hex(6),
                    name=self._rng.choice(_DUEL_BOT_NAMES), level=npc_level,
-                   faction='blue' if p['faction']=='red' else 'red', ws=None)
+                   faction='blue' if p['faction']=='red' else 'red', ws=None,
+                   bot_profile=_duel_bot_make_profile(npc_level, self._rng))
         await self._start(p,npc)
 
     async def _start(self, a, b):
         mid = secrets.token_hex(12)
         now = time.monotonic()
-        # NPC의 첫 수확도 약간 늦게 시작해 실제 재배 템포를 만듭니다.
-        npc_next = {
-            p['uid']: now + self._rng.uniform(5.0, 11.0)
-            for p in (a, b) if p['ws'] is None
-        }
+        # NPC 숙련도는 경기 내내 동일. 첫 수확도 해당 숙련도 간격을 적용.
+        npc_next = {}
+        for p in (a, b):
+            if p['ws'] is None:
+                if not p.get('bot_profile'):
+                    p['bot_profile'] = _duel_bot_make_profile(p['level'], self._rng)
+                npc_next[p['uid']] = now + _duel_bot_delay(p['bot_profile'], self._rng)
         match = dict(id=mid, players=(a,b), start=now,
                      start_wall=datetime.now(timezone.utc),
                      score={a['uid']:0,b['uid']:0}, actions=set(), pending=set(),
@@ -7119,23 +7217,20 @@ class _RoseDuelService:
                 m = self.matches.get(mid)
                 if m is None:
                     return
+                # 잠자는 동안 3분이 끝났다면 추가 수확을 만들지 않습니다.
+                current = time.monotonic()
+                if current - m['start'] >= _DUEL_PLAY_SEC:
+                    break
                 for p in m['players']:
                     if p['ws'] is not None:
                         continue
-                    # NPC는 매초 점수를 얻지 않고, 개별 수확 시각에만 기록합니다.
-                    # Lv.10: 보통 8~16초 간격 / Lv.50: 대략 4~12초 간격.
-                    # 실전 가독성과 피로도를 위해 기존 NPC보다 느리게 조절합니다.
-                    current = time.monotonic()
                     if current < m['npc_next'].get(p['uid'], float('inf')):
                         continue
-                    level = max(10, min(50, int(p['level'])))
-                    bunch = self._rng.randint(1, 2 + (level - 10) // 20)
-                    m['score'][p['uid']] += bunch
-                    # 긴 쉬는 시간도 섞어 매번 같은 간격으로 오르지 않도록 합니다.
-                    next_gap = 7.5 - (level - 10) * 0.095 + self._rng.uniform(0, 7)
-                    if self._rng.random() < 0.12:
-                        next_gap += self._rng.uniform(3, 8)
-                    m['npc_next'][p['uid']] = current + next_gap
+                    profile = p['bot_profile']
+                    # 실제 사람처럼 '수확 시점'에만 점수를 올립니다.
+                    # 이용자 점수에 맞춰 강제로 점수/속도를 변경하지 않습니다.
+                    m['score'][p['uid']] += _duel_bot_harvest_amount(profile, self._rng)
+                    m['npc_next'][p['uid']] = current + _duel_bot_delay(profile, self._rng)
                 await self._broadcast(mid)
         except Exception as exc:
             print('[장미 대결 타이머 오류]', repr(exc))
