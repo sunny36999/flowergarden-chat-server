@@ -1,11 +1,33 @@
 # ============================================================================
+# 2026-10-25 인수인계: 장미 대결 사람 매칭 3구간 + 레벨별 NPC 4단계 조정
+# [이번 변경/확정] 사람끼리는 반대 진영 + 동일 구간(1~19/20~29/30~50)
+#   + 레벨 차이 5 이내일 때만 매칭. 후보 중 레벨 차이 작은 순/대기 오래된 순.
+#   구간을 건너서 매칭하거나 Lv.30과 Lv.50을 강제 매칭하지 않음.
+#   10초 내 적절한 반대 진영 사람이 없으면 자기 레벨 NPC 1명과 대결.
+#   기존 대결 참가 조건 Lv.10 이상은 변경하지 않음(Lv.1~9 대결 잠금 유지).
+# [NPC] 모든 참가 레벨에서 초보10%/일반40%/숙련40%/달인10% 무작위.
+#   Lv.50 기준 3분 목표 점수: 초보 150~250 / 일반 250~350 /
+#   숙련 350~450 / 달인 450~550. 이는 강제 점수가 아니라 수확 간격의
+#   밸런스 목표이며 실제 점수는 가상 꽃 레벨/정원/확률에 따라 달라짐.
+#   NPC 꽃레벨·정원 개방은 이전 구현 유지. 이용자 점수에 맞춰 조작 안 함.
+# [표시] duel_match_start에 NPC일 때만 opponent_skill(초보/일반/숙련/달인)
+#   과 opponent_is_bot을 추가. 실제 사람은 opponent_skill 빈 문자열.
+#   Godot HUD 상대명 옆에 [숙련도] 표시(기존 PNG 수정 없음).
+# [보존] 기존 DB/계정/랭킹/일일 좋아요/경기당 쿠폰 1장 무제한/펫 보너스,
+#   협동정원/채팅/장터/저장/교환소 등 변경하지 않음.
+# [적용] 서버: 이 파일로 GitHub의 flowergarden_chat_server_render.py 교체,
+#   Render Live 확인. Godot: 함께 제공한 soil.gd 교체 후 F5.
+# [검증] Python 구문, 매칭 경계, NPC 점수 분포는 오프라인 검사;
+#   실제 운영서버/DB와 Godot 런타임 통합 테스트는 별도 필요.
+# ============================================================================
+# ============================================================================
 # 2026-10-25 인수인계: 장미 1:1 대결 자동 상대 레벨별 4단계 난이도 (이번 수정)
 # [요청] Godot soil.gd/그림은 수정하지 않음. 기존 서버 DB·꽃쿠폰·랭킹 유지.
 # [자동상대] 정원사 Lv.10~19 / 20~29 / 30~39 / 40~50의 네 구간.
 #   각 구간에서 매 경기 초보 10% · 일반 40% · 숙련 40% · 달인 10% 추첨.
 #   숙련도는 경기 시작 시 1회 확정, 진행 중 이용자 점수로 난이도 변경 금지.
 #   수확 간격: 초보 9~13초 / 일반 6~8초 / 숙련 4.5~5.6초 / 달인 3.7~4.4초.
-#   사람처럼 짧은 휴식 간혹 발생하며, 수확할 때만 점수 증가.
+#   2026-10-25 새 목표 간격은 맨 위 인수인계 메모 우선. 수확할 때만 점수 증가.
 # [레벨별 정원] Lv.10~19 중앙 100%; Lv.20~29 중앙30%/오른쪽70%;
 #   Lv.30~50 중앙20%/오른쪽30%/왼쪽50%.
 #   정원별 실제 배율: 중앙1배·오른쪽2배·왼쪽3배.
@@ -7009,7 +7031,7 @@ async def handle_duel_ranking_like(ws,payload):
 
 # ==================================================
 # 🌹 레드로즈 / 블루로즈 1:1 대결 (DB 보상/랭킹 연결)
-# - 이용자 매칭: 반대 진영, 레벨 ±3, 최대 10초
+# - 이용자 매칭: 반대 진영 + 같은 개방 구간 + 레벨 ±5, 최대 10초
 # - 미매칭시 자동 정원사 / 경기 180초
 # - 실제 수확 기록 조회 후 점수 반영
 # - 기존 DB 구조·협동/보상 기능 변경 없음
@@ -7019,7 +7041,20 @@ import random as _duel_random
 
 _DUEL_WAIT_SEC = 10
 _DUEL_PLAY_SEC = 180
-_DUEL_LEVEL_GAP = 3
+_DUEL_LEVEL_GAP = 5
+def _duel_match_bracket(level):
+    """수확 가능한 정원 수가 같은 사람끼리만 대결하게 합니다.
+
+    이전 Lv.10 대결 잠금은 변경하지 않지만 그룹 이름은 Lv.1부터 적용.
+    """
+    level = int(level)
+    if level < 20:
+        return 0
+    if level < 30:
+        return 1
+    return 2
+
+
 _DUEL_BOT_NAMES = (
     '달빛정원', '새벽이슬', '꽃송이77', '별빛화원',
     '봄바람', '장미한송이', '햇살정원', '초록잎새',
@@ -7028,10 +7063,10 @@ _DUEL_BOT_NAMES = (
 # 자동 상대의 네 가지 실력은 모든 레벨 구간에 존재합니다.
 # (키, 한글이름, 가중치, 최소간격, 최대간격, 휴식확률)
 _DUEL_BOT_SKILLS = (
-    ('novice', '초보', 10, 9.0, 13.0, 0.12),
-    ('normal', '일반', 40, 6.0, 8.0, 0.08),
-    ('skilled', '숙련', 40, 4.5, 5.6, 0.04),
-    ('master', '달인', 10, 3.7, 4.4, 0.02),
+    ('novice', '초보', 10, 10.5, 12.5, 0.12),
+    ('normal', '일반', 40, 7.4, 8.4, 0.08),
+    ('skilled', '숙련', 40, 5.3, 6.0, 0.04),
+    ('master', '달인', 10, 4.2, 4.8, 0.02),
 )
 
 
@@ -7155,10 +7190,12 @@ class _RoseDuelService:
                   faction=faction, ws=ws, queued_at=time.monotonic())
         possible = [p for p in self.waiting.values()
                     if p['faction'] != faction and p['uid'] != uid
+                    and _duel_match_bracket(p['level']) == _duel_match_bracket(level)
                     and abs(p['level']-level) <= _DUEL_LEVEL_GAP]
         await self._send(ws, {'type':'duel_queue_result','ok':True})
         if possible:
-            other = min(possible, key=lambda p:p['queued_at'])
+            # 가장 가까운 레벨 먼저, 같은 거리라면 먼저 기다린 사람부터.
+            other = min(possible, key=lambda p: (abs(p['level'] - level), p['queued_at']))
             self.waiting.pop(other['uid'], None)
             await self._start(me, other)
         else:
@@ -7203,6 +7240,9 @@ class _RoseDuelService:
                     'type':'duel_match_start','match_id':mid,
                     'opponent_name':opponent['name'],
                     'opponent_level':opponent['level'],
+                    'opponent_is_bot':opponent['ws'] is None,
+                    'opponent_skill':(opponent.get('bot_profile') or {}).get('skill_name','')
+                        if opponent['ws'] is None else '',
                     'duration_seconds':_DUEL_PLAY_SEC})
         asyncio.create_task(self._timer(mid))
 
