@@ -3096,7 +3096,7 @@ def format_guestbook_time(value) -> str:
 FRIEND_CHEER_RELEASE_AT = datetime(2026, 11, 9, 5, 0, tzinfo=KST)
 FRIEND_CHEER_EGG_REWARD = 5
 FRIEND_CHEER_TEST_ENABLED = os.getenv("FRIEND_CHEER_TEST_ENABLED", "0") == "1"
-FRIEND_CHEER_PUBLIC_ENABLED = os.getenv("FRIEND_CHEER_PUBLIC_ENABLED", "0") == "1"
+FRIEND_CHEER_PUBLIC_ENABLED = os.getenv("FRIEND_CHEER_PUBLIC_ENABLED", "1") == "1"
 FRIEND_CHEER_TEST_GARDEN_NUMBERS = frozenset(
     number.strip() for number in os.getenv("FRIEND_CHEER_TEST_GARDEN_NUMBERS", "").split(",")
     if number.strip()
@@ -3118,7 +3118,7 @@ FRIEND_THANK_MESSAGES = (
 
 
 def friend_cheer_live() -> bool:
-    # 서버 작업 중 자동 오픈 방지: 날짜와 공개 승인 플래그를 모두 만족해야 함.
+    # 11월 9일 05:00 KST 자동 공개. 환경변수를 0으로 지정한 경우에만 긴급 중지.
     return FRIEND_CHEER_PUBLIC_ENABLED and datetime.now(KST) >= FRIEND_CHEER_RELEASE_AT
 
 
@@ -3172,7 +3172,7 @@ def create_friend_cheer(sender_user_id: str, receiver_garden_number: str):
         return False, "friend_not_found", "친구의 계정을 찾지 못했어요."
     receiver_user_id = str(receiver["user_id"])
     if not friend_cheer_allowed(receiver_user_id):
-        return False, "test_accounts_only", "가오픈은 등록된 테스트 친구끼리만 사용할 수 있어요."
+        return False, "test_accounts_only", "아직 응원할 수 없는 친구예요."
     if sender_user_id == receiver_user_id:
         return False, "self_cheer", "내 정원에는 응원할 수 없어요."
     if get_friend_status(sender_user_id, receiver_user_id) != "friends":
@@ -3188,6 +3188,18 @@ def create_friend_cheer(sender_user_id: str, receiver_garden_number: str):
                     "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
                     (pair[0] + ':' + pair[1], str(cheer_day)),
                 )
+                # 계정별 동시 요청을 직렬화해 서버에서도 하루 3명 제한을 보장합니다.
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+                    ("friend_cheer_sender:" + sender_user_id, str(cheer_day)),
+                )
+                cur.execute(
+                    """SELECT COUNT(*) FROM gardener_friend_cheers
+                       WHERE sender_user_id=%s AND cheer_day=%s""",
+                    (sender_user_id, cheer_day),
+                )
+                if int(cur.fetchone()[0]) >= 3:
+                    return False, "daily_limit", "오늘은 친구 3명까지 응원할 수 있어요."
                 cur.execute(
                     """INSERT INTO gardener_friend_cheers(sender_user_id,receiver_user_id,cheer_day)
                        VALUES(%s,%s,%s)
@@ -3295,7 +3307,7 @@ def create_friend_cheer_thanks(user_id: str, cheer_entry_id: int):
                     return False, "invalid_entry", "내 방명록의 응원글만 감사 인사할 수 있어요."
                 supporter_id=str(row[1])
                 if not friend_cheer_allowed(supporter_id):
-                    return False,"test_accounts_only","가오픈은 테스트 친구에게만 감사 인사를 보낼 수 있어요."
+                    return False,"test_accounts_only","아직 감사 인사를 보낼 수 없는 친구예요."
                 if get_friend_status(user_id,supporter_id)!="friends":
                     return False,"friends_only","친구에게만 감사 인사를 보낼 수 있어요."
                 cur.execute(
