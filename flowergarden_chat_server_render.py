@@ -3086,11 +3086,13 @@ def format_guestbook_time(value) -> str:
 
 
 # ==================================================
-# 2026-10-28 친구 응원 보상 수정: 같은 친구끼리 당일 상호 응원 시에만 양쪽 펫 알 5개
-# - 첫 응원: 기록 및 방명록만 저장, 보상 없음. 맞응원: 양쪽 각 5개를 1회씩 원장에 기록.
-# - 같은 친구 쌍/같은 KST 05:00 날짜는 DB 잠금과 고유키로 중복 지급 방지.
-# - 기존 펫 시스템, 다른 게임 기능 및 기존 데이터/테이블 삭제·초기화 없음.
-# 🐾 친구 응원: 친구 1명당 하루 1회, 상호 응원 완료 시 양쪽 펫 알 5개
+# 2026-10-31 친구 응원 규칙: 응원 인원 제한 없음, 같은 친구에게 하루 1회
+# - 응원 즉시 보내는 사람과 받는 사람 모두 펫 알 5개씩 지급 (맞응원 불필요).
+# - 맞응원을 별도로 보내면 양쪽이 한 번씩 더 5개를 받습니다.
+# - 같은 방향의 중복 응원은 고유키와 DB 잠금으로 방지합니다.
+# - 고마워요 답장은 메시지만 보내고 펫 알 보상은 없습니다.
+# - 기존 펫/방명록/계정/거래 데이터와 DB 테이블은 그대로 보존합니다.
+# 🐾 친구 응원: 친구 1명당 하루 1회, 인원 무제한, 응원 즉시 양쪽 펫 알 5개
 # 테스트: 서버 환경변수에 지정된 정원번호끼리만 허용
 # ==================================================
 FRIEND_CHEER_RELEASE_AT = datetime(2026, 11, 9, 5, 0, tzinfo=KST)
@@ -3178,8 +3180,8 @@ def create_friend_cheer(sender_user_id: str, receiver_garden_number: str):
     if get_friend_status(sender_user_id, receiver_user_id) != "friends":
         return False, "friends_only", "친구가 된 정원사에게만 응원할 수 있어요."
     try:
-        # 같은 두 계정의 동시 응원을 직렬화하여 상호 응원 보상이 빠지거나 중복되지 않게 합니다.
-        # 응원기록/방명록/보상원장을 한 트랜잭션에서 처리하고, 기존 펫 데이터는 변경하지 않습니다.
+        # 동일 친구 쌍의 동시 요청을 직렬화합니다. 응원/방명록/보상은 한 트랜잭션.
+        # 응원 방향별 하루 1회 고유키를 사용하며 기존 펫/방명록 데이터는 유지합니다.
         cheer_day = friend_cheer_day()
         pair = sorted((sender_user_id, receiver_user_id))
         with get_account_db_connection() as conn:
@@ -3188,18 +3190,6 @@ def create_friend_cheer(sender_user_id: str, receiver_garden_number: str):
                     "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
                     (pair[0] + ':' + pair[1], str(cheer_day)),
                 )
-                # 계정별 동시 요청을 직렬화해 서버에서도 하루 3명 제한을 보장합니다.
-                cur.execute(
-                    "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
-                    ("friend_cheer_sender:" + sender_user_id, str(cheer_day)),
-                )
-                cur.execute(
-                    """SELECT COUNT(*) FROM gardener_friend_cheers
-                       WHERE sender_user_id=%s AND cheer_day=%s""",
-                    (sender_user_id, cheer_day),
-                )
-                if int(cur.fetchone()[0]) >= 3:
-                    return False, "daily_limit", "오늘은 친구 3명까지 응원할 수 있어요."
                 cur.execute(
                     """INSERT INTO gardener_friend_cheers(sender_user_id,receiver_user_id,cheer_day)
                        VALUES(%s,%s,%s)
@@ -3221,26 +3211,17 @@ def create_friend_cheer(sender_user_id: str, receiver_garden_number: str):
                     "UPDATE gardener_friend_cheers SET guestbook_entry_id=%s WHERE cheer_id=%s",
                     (entry_id, cheer_id),
                 )
-                cur.execute(
-                    """SELECT cheer_id FROM gardener_friend_cheers
-                       WHERE sender_user_id=%s AND receiver_user_id=%s AND cheer_day=%s""",
-                    (receiver_user_id, sender_user_id, cheer_day),
-                )
-                reverse_row = cur.fetchone()
-                if reverse_row is not None:
-                    # 최초 응원 ID에 양쪽 보상을 묶으면 맞응원 순서와 무관하게 하루 1회만 지급됩니다.
-                    first_cheer_id = min(cheer_id, int(reverse_row[0]))
-                    for user_id in pair:
-                        cur.execute(
-                            """INSERT INTO gardener_friend_cheer_rewards(cheer_id,receiver_user_id,pet_eggs)
-                               VALUES(%s,%s,%s)
-                               ON CONFLICT(cheer_id,receiver_user_id) DO NOTHING""",
-                            (first_cheer_id, user_id, FRIEND_CHEER_EGG_REWARD),
-                        )
+                # 응원한 사람과 받은 사람에게 각각 보상 등록 (상대 맞응원 불필요).
+                # 각 cheer_id별로 양쪽에 한 번씩 기록하므로 방향별 응원도 독립적으로 보상됩니다.
+                for user_id in pair:
+                    cur.execute(
+                        """INSERT INTO gardener_friend_cheer_rewards(cheer_id,receiver_user_id,pet_eggs)
+                           VALUES(%s,%s,%s)
+                           ON CONFLICT(cheer_id,receiver_user_id) DO NOTHING""",
+                        (cheer_id, user_id, FRIEND_CHEER_EGG_REWARD),
+                    )
             conn.commit()
-        if reverse_row is None:
-            return True, "ok", "응원을 보냈어요! 친구가 맞응원하면 서로 펫 알 5개씩 받아요."
-        return True, "ok", "서로 응원 완료! 양쪽에 펫 알 5개씩 지급 대기 중이에요."
+        return True, "ok", "응원을 보냈어요! 서로 펫 알 5개씩 지급 대기 중이에요."
     except Exception as exc:
         print(f"[친구 응원 처리 오류] {type(exc).__name__}: {exc}")
         return False, "friend_cheer_db_error", "응원을 보내지 못했어요. 잠시 후 다시 시도해주세요."
