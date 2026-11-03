@@ -1078,6 +1078,76 @@ def run_one_time_requested_account_cleanup_20261007() -> None:
         )
 
 
+def run_one_time_requested_account_cleanup_20261103() -> None:
+    """Only the two specified old accounts; all-or-nothing and one-time."""
+    if not DATABASE_URL:
+        return
+    migration_id = "delete_old_hints_985585_391584_20261103_v1"
+    targets = (("985585", "힌츠", 30), ("391584", "이전힌츠391584", 35))
+    try:
+        with get_account_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""CREATE TABLE IF NOT EXISTS server_admin_migrations (
+                    migration_id VARCHAR(120) PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )""")
+                cur.execute(
+                    "SELECT 1 FROM server_admin_migrations WHERE migration_id = %s",
+                    (migration_id,)
+                )
+                if cur.fetchone() is not None:
+                    return
+
+                matches = []
+                for garden_number, expected_name, expected_level in targets:
+                    cur.execute("""SELECT user_id, nickname, level
+                                   FROM gardener_accounts
+                                   WHERE garden_number = %s FOR UPDATE""",
+                                (garden_number,))
+                    row = cur.fetchone()
+                    if (row is None or str(row[1]) != expected_name
+                            or int(row[2]) != expected_level):
+                        print(f"[계정정리] 본인확인 불일치, 작업 중단: {garden_number}")
+                        return
+                    matches.append((str(row[0]), garden_number, expected_name,
+                                    expected_level))
+
+                user_ids = [entry[0] for entry in matches]
+                if len(set(user_ids)) != 2:
+                    print("[계정정리] 중복 user_id, 작업 중단")
+                    return
+                cur.execute("SELECT user_id FROM gardener_accounts WHERE garden_number = %s",
+                            ("880561",))
+                protected = cur.fetchone()
+                if protected and str(protected[0]) in user_ids:
+                    print("[계정정리] 연재정원 보호조건 충돌, 작업 중단")
+                    return
+
+                # Another player's market transaction history must never be removed.
+                cur.execute("""SELECT COUNT(*) FROM harvest_market_sales
+                               WHERE seller_user_id = ANY(%s)
+                                  OR buyer_user_id = ANY(%s)""",
+                            (user_ids, user_ids))
+                if int(cur.fetchone()[0]) != 0:
+                    print("[계정정리] 관련 장터 판매기록 존재, 작업 보류")
+                    return
+
+                for user_id, number, nickname, level in matches:
+                    cur.execute("""DELETE FROM gardener_accounts
+                                   WHERE user_id = %s AND garden_number = %s
+                                     AND nickname = %s AND level = %s
+                                   RETURNING user_id""",
+                                (user_id, number, nickname, level))
+                    if cur.fetchone() is None:
+                        raise RuntimeError("일치 조건 변경됨: 전체 롤백")
+                cur.execute("INSERT INTO server_admin_migrations(migration_id) VALUES (%s)",
+                            (migration_id,))
+            conn.commit()
+        print("[계정정리] 지정 계정 2개 삭제 완료: 985585, 391584")
+    except Exception as exc:
+        print(f"[계정정리 오류] {type(exc).__name__}: {exc}")
+
+
 def run_one_time_together_garden_reward_recovery() -> None:
     """기존 1,000송이 목표에서 이미 통과한 10%/25% 미지급 보상을 1회 복구합니다."""
     if not DATABASE_URL:
@@ -8021,6 +8091,7 @@ async def main():
         run_one_time_account_cleanup()
         run_one_time_hera_account_cleanup()
         run_one_time_requested_account_cleanup_20261007()
+        run_one_time_requested_account_cleanup_20261103()
         run_one_time_together_garden_reward_recovery()
 
     print("=" * 60)
