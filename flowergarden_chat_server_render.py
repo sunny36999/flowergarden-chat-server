@@ -1123,14 +1123,21 @@ def run_one_time_requested_account_cleanup_20261103() -> None:
                     print("[계정정리] 연재정원 보호조건 충돌, 작업 중단")
                     return
 
-                # Another player's market transaction history must never be removed.
-                cur.execute("""SELECT COUNT(*) FROM harvest_market_sales
-                               WHERE seller_user_id = ANY(%s)
-                                  OR buyer_user_id = ANY(%s)""",
-                            (user_ids, user_ids))
-                if int(cur.fetchone()[0]) != 0:
-                    print("[계정정리] 관련 장터 판매기록 존재, 작업 보류")
-                    return
+                # 운영자가 관련 장터 거래기록과 미수령 보상 정리를 승인함.
+                # 연관된 거래를 먼저 지우면 delivery는 FK ON DELETE CASCADE로 함께 정리됨.
+                # 아래 DELETE와 계정 삭제는 같은 DB 트랜잭션으로 처리됨.
+                cur.execute(
+                    """DELETE FROM harvest_market_sales
+                       WHERE seller_user_id = ANY(%s)
+                          OR buyer_user_id = ANY(%s)
+                          OR listing_id IN (
+                              SELECT listing_id
+                              FROM harvest_market_listings
+                              WHERE seller_user_id = ANY(%s)
+                          )""",
+                    (user_ids, user_ids, user_ids),
+                )
+                print(f"[계정정리] 연결된 장터 거래기록 {cur.rowcount}건 정리")
 
                 for user_id, number, nickname, level in matches:
                     cur.execute("""DELETE FROM gardener_accounts
